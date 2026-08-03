@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      3.4
+// @version      3.5
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -36,7 +36,8 @@
         checkIntervalMs: 1500,
         escalationDelayMs: 8000,       // how long a bet window must stay open + you stay away before we buzz your phone
         telegramMinIntervalMs: 60000,  // don't phone-ping more than once per minute, even if multiple windows escalate
-        panelCollapsed: false
+        panelCollapsed: false,
+        panelPos: null // { left, top } in px once the user has dragged it; null = default bottom-left
     };
 
     function loadSettings() {
@@ -150,22 +151,40 @@
     // ---------------------------------------------------------------
     let lastTelegramSentAt = 0;
 
-    function sendTelegram(text) {
-        if (!settings.telegramEnabled || !settings.masterEnabled) return;
-        if (!settings.telegramBotToken || !settings.telegramChatId) return;
+    // Returns a promise resolving to { ok: boolean, reason?: string } so
+    // callers (like the test button) can report what actually happened,
+    // instead of assuming success the moment the request was fired off.
+    function sendTelegram(text, opts) {
+        const bypassRateLimit = opts && opts.bypassRateLimit;
+
+        if (!settings.telegramEnabled || !settings.masterEnabled) {
+            return Promise.resolve({ ok: false, reason: 'Telegram/master toggle is off' });
+        }
+        if (!settings.telegramBotToken || !settings.telegramChatId) {
+            return Promise.resolve({ ok: false, reason: 'missing bot token or chat ID' });
+        }
 
         const now = Date.now();
-        if (now - lastTelegramSentAt < settings.telegramMinIntervalMs) return;
+        if (!bypassRateLimit && now - lastTelegramSentAt < settings.telegramMinIntervalMs) {
+            return Promise.resolve({ ok: false, reason: 'rate-limited, try again shortly' });
+        }
         lastTelegramSentAt = now;
 
         const url = `https://api.telegram.org/bot${settings.telegramBotToken}/sendMessage`;
-        fetch(url, {
+        return fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ chat_id: settings.telegramChatId, text })
-        }).then(res => {
-            if (!res.ok) console.warn('Stake Notifier: Telegram send failed', res.status);
-        }).catch(err => console.warn('Stake Notifier: Telegram send error', err));
+        }).then(async res => {
+            if (res.ok) return { ok: true };
+            let detail = '';
+            try { detail = (await res.json()).description || ''; } catch (e) { /* ignore */ }
+            console.warn('Stake Notifier: Telegram send failed', res.status, detail);
+            return { ok: false, reason: detail || `HTTP ${res.status}` };
+        }).catch(err => {
+            console.warn('Stake Notifier: Telegram send error', err);
+            return { ok: false, reason: err.message || 'network/CORS error' };
+        });
     }
 
     // ---------------------------------------------------------------
@@ -350,8 +369,9 @@
             }
             #sn-header {
                 display: flex; align-items: center; gap: 8px;
-                padding: 10px 12px; cursor: pointer; user-select: none;
+                padding: 10px 12px; cursor: grab; user-select: none; touch-action: none;
             }
+            #sn-header:active { cursor: grabbing; }
             #sn-dot { width: 7px; height: 7px; border-radius: 50%; background: #4caf50; flex-shrink: 0; }
             #sn-title { font-weight: 600; font-size: 12.5px; flex: 1; }
             #sn-toggle-arrow { font-size: 10px; color: #8a8d99; }
@@ -421,6 +441,12 @@
 
         document.body.appendChild(panel);
 
+        if (settings.panelPos) {
+            panel.style.left = settings.panelPos.left + 'px';
+            panel.style.top = settings.panelPos.top + 'px';
+            panel.style.bottom = 'auto';
+        }
+
         const header = panel.querySelector('#sn-header');
         const toggleArrow = panel.querySelector('#sn-toggle-arrow');
         const body = panel.querySelector('#sn-body');
@@ -441,12 +467,56 @@
             toggleArrow.textContent = settings.panelCollapsed ? '▸' : '▾';
         }
 
-        header.addEventListener('click', () => {
-            settings.panelCollapsed = !settings.panelCollapsed;
-            saveSettings(settings);
-            applyCollapsed();
-        });
         applyCollapsed();
+
+        // Dragging the header moves the panel; a plain click (no movement)
+        // toggles collapse instead - both live on the same pointer sequence.
+        let dragging = false;
+        let dragMoved = false;
+        let dragStartX = 0, dragStartY = 0, panelStartLeft = 0, panelStartTop = 0;
+
+        header.addEventListener('pointerdown', (e) => {
+            dragging = true;
+            dragMoved = false;
+            const rect = panel.getBoundingClientRect();
+            panelStartLeft = rect.left;
+            panelStartTop = rect.top;
+            dragStartX = e.clientX;
+            dragStartY = e.clientY;
+            header.setPointerCapture(e.pointerId);
+        });
+
+        header.addEventListener('pointermove', (e) => {
+            if (!dragging) return;
+            const dx = e.clientX - dragStartX;
+            const dy = e.clientY - dragStartY;
+            if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragMoved = true;
+            if (!dragMoved) return;
+
+            const maxLeft = window.innerWidth - panel.offsetWidth - 4;
+            const maxTop = window.innerHeight - panel.offsetHeight - 4;
+            const newLeft = Math.max(4, Math.min(panelStartLeft + dx, maxLeft));
+            const newTop = Math.max(4, Math.min(panelStartTop + dy, maxTop));
+
+            panel.style.left = newLeft + 'px';
+            panel.style.top = newTop + 'px';
+            panel.style.bottom = 'auto';
+        });
+
+        header.addEventListener('pointerup', (e) => {
+            if (!dragging) return;
+            dragging = false;
+            header.releasePointerCapture(e.pointerId);
+
+            if (dragMoved) {
+                settings.panelPos = { left: parseFloat(panel.style.left), top: parseFloat(panel.style.top) };
+                saveSettings(settings);
+            } else {
+                settings.panelCollapsed = !settings.panelCollapsed;
+                saveSettings(settings);
+                applyCollapsed();
+            }
+        });
 
         masterCb.checked = settings.masterEnabled;
         soundCb.checked = settings.soundEnabled;
@@ -506,17 +576,25 @@
                 }
             });
         });
-        panel.querySelector('#sn-test-telegram').addEventListener('click', () => {
+        panel.querySelector('#sn-test-telegram').addEventListener('click', async () => {
             if (!tokenInput.value.trim() || !chatIdInput.value.trim()) {
                 alert('Enter your bot token and chat ID first.');
                 return;
             }
             settings.telegramBotToken = tokenInput.value.trim();
             settings.telegramChatId = chatIdInput.value.trim();
+            settings.telegramEnabled = true;
+            telegramCb.checked = true;
             saveSettings(settings);
-            lastTelegramSentAt = 0; // bypass rate limit for a manual test
-            sendTelegram('Stake Notifier test - if you got this, your phone push is working.');
-            status.textContent = 'Test message sent - check your phone.';
+
+            status.textContent = 'Sending test message...';
+            const result = await sendTelegram(
+                'Stake Notifier test - if you got this, your phone push is working.',
+                { bypassRateLimit: true }
+            );
+            status.textContent = result.ok
+                ? 'Sent - check your phone.'
+                : `Failed: ${result.reason}`;
         });
     }
 
@@ -553,7 +631,7 @@
 
     function init(mode) {
         currentMode = mode;
-        console.log(`Stake Notifier: active (v3.4, mode=${mode}, frame=${location.hostname})`);
+        console.log(`Stake Notifier: active (v3.5, mode=${mode}, frame=${location.hostname})`);
         logIframeAccess();
 
         // Both the lobby page and the game iframe run this script, and each
