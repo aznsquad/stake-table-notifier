@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      4.3
+// @version      4.4
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -589,7 +589,21 @@
             .sn-section { padding: 10px 0; border-top: 1px solid rgba(255,255,255,0.07); }
             .sn-section:first-child { border-top: none; padding-top: 2px; }
             .sn-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; cursor: pointer; }
-            .sn-row input[type="checkbox"] { accent-color: #4caf50; width: 14px; height: 14px; cursor: pointer; }
+            /* Custom-drawn checkbox, not relying on native appearance - the
+               host page's own CSS resets (e.g. appearance:none on all
+               inputs) can otherwise make native checkboxes render as
+               completely invisible even though they still work. */
+            .sn-checkbox-wrap { position: relative; width: 14px; height: 14px; flex-shrink: 0; }
+            .sn-checkbox-wrap input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+            .sn-checkbox-box {
+                position: absolute; inset: 0; border: 1px solid rgba(255,255,255,0.4);
+                border-radius: 3px; background: #1e2029; pointer-events: none;
+            }
+            .sn-checkbox-wrap input:checked + .sn-checkbox-box { background: #4caf50; border-color: #4caf50; }
+            .sn-checkbox-wrap input:checked + .sn-checkbox-box::after {
+                content: ''; position: absolute; left: 4px; top: 1px; width: 3px; height: 7px;
+                border: solid #14151c; border-width: 0 2px 2px 0; transform: rotate(45deg);
+            }
             .sn-sub-row { display: flex; align-items: center; gap: 8px; padding: 4px 0 4px 22px; }
             .sn-sub-row input[type="range"] { flex: 1; accent-color: #4caf50; }
             #sn-volume-label { width: 30px; text-align: right; font-size: 10px; color: #8a8d99; }
@@ -619,18 +633,18 @@
             </div>
             <div id="sn-body">
                 <div class="sn-section">
-                    <label class="sn-row"><input type="checkbox" id="sn-master"> Enabled</label>
-                    <label class="sn-row"><input type="checkbox" id="sn-sound"> Sound</label>
+                    <label class="sn-row"><span class="sn-checkbox-wrap"><input type="checkbox" id="sn-master"><span class="sn-checkbox-box"></span></span> Enabled</label>
+                    <label class="sn-row"><span class="sn-checkbox-wrap"><input type="checkbox" id="sn-sound"><span class="sn-checkbox-box"></span></span> Sound</label>
                     <div class="sn-sub-row">
                         <span>🔊</span>
                         <input type="range" id="sn-volume" min="0" max="100" step="1">
                         <span id="sn-volume-label"></span>
                     </div>
-                    <label class="sn-row"><input type="checkbox" id="sn-notif"> Windows popups</label>
+                    <label class="sn-row"><span class="sn-checkbox-wrap"><input type="checkbox" id="sn-notif"><span class="sn-checkbox-box"></span></span> Windows popups</label>
                 </div>
 
                 <div class="sn-section">
-                    <label class="sn-row"><input type="checkbox" id="sn-telegram"> Phone push (Telegram)</label>
+                    <label class="sn-row"><span class="sn-checkbox-wrap"><input type="checkbox" id="sn-telegram"><span class="sn-checkbox-box"></span></span> Phone push (Telegram)</label>
                     <div id="sn-telegram-fields" class="sn-fields-wrap" style="display:none;">
                         <input id="sn-tg-token" class="sn-field" type="password" placeholder="Bot token">
                         <input id="sn-tg-chatid" class="sn-field" type="text" placeholder="Chat ID">
@@ -846,7 +860,7 @@
 
     function init(mode) {
         currentMode = mode;
-        console.log(`Stake Notifier: active (v4.3, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
+        console.log(`Stake Notifier: active (v4.4, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
         logIframeAccess();
 
         // Both the lobby page and the game iframe run this script, but the
