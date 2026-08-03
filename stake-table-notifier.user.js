@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      4.2
+// @version      4.3
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -240,16 +240,6 @@
     function looksLikeTargetGame(text) {
         const lower = text.toLowerCase();
         return KEYWORDS.some(k => lower.includes(k));
-    }
-
-    // True once a game is actually embedded/open within this lobby page
-    // (a reasonably large iframe is present) - used to decide whether the
-    // lobby's own panel should show, or defer to the game view's panel.
-    function hasEmbeddedGameIframe() {
-        return Array.from(document.querySelectorAll('iframe')).some(f => {
-            const rect = f.getBoundingClientRect();
-            return rect.width > 300 && rect.height > 300;
-        });
     }
 
     // Evolution and Pragmatic use the same underlying idea (surface
@@ -856,16 +846,16 @@
 
     function init(mode) {
         currentMode = mode;
-        console.log(`Stake Notifier: active (v4.2, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
+        console.log(`Stake Notifier: active (v4.3, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
         logIframeAccess();
 
-        // Both the lobby page and the game iframe run this script. When a
-        // game is actually open, its iframe sits embedded inside the same
-        // lobby page - so showing a panel in both places at once would be
-        // two boxes on screen. But on Evolution, "Hot Roads" is a pure
-        // lobby-page feature (no game open yet), so the lobby needs its
-        // own panel too whenever there's no game currently embedded there.
-        if (mode === 'game-frame' || (mode === 'lobby' && !hasEmbeddedGameIframe())) {
+        // Both the lobby page and the game iframe run this script, but the
+        // panel only ever shows on the lobby/main window - never inside the
+        // embedded multiplay/game frame itself, so there's exactly one box
+        // on screen. All the actual detection (bet windows, Good/Hot Roads)
+        // still runs in the game frame regardless; settings are shared
+        // across both via GM storage, so toggles here still apply there.
+        if (mode === 'lobby') {
             buildPanel();
         }
 
