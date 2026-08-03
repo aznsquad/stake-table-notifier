@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      3.3
+// @version      3.4
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -553,7 +553,7 @@
 
     function init(mode) {
         currentMode = mode;
-        console.log(`Stake Notifier: active (v3.3, mode=${mode}, frame=${location.hostname})`);
+        console.log(`Stake Notifier: active (v3.4, mode=${mode}, frame=${location.hostname})`);
         logIframeAccess();
 
         // Both the lobby page and the game iframe run this script, and each
