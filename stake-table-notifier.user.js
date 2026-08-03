@@ -1,14 +1,22 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      3.0
+// @version      3.1
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
-// @match        https://stake.com/casino/games/*
-// @match        https://stake.com/casino/live/*
+// @match        *://*/*
 // @grant        none
 // @run-at       document-end
 // ==/UserScript==
+
+// NOTE on @match *://*/*: the actual live-casino game client (Big Road,
+// Good Roads tab, bet button) loads inside a separate iframe served from
+// a randomized, rotating domain - not stake.com. Tampermonkey only injects
+// a script into a frame whose OWN url matches @match, so there is no fixed
+// domain we can pin here. Instead this script runs everywhere and
+// self-detects (see FRAME GUARD below) whether the current page/frame is
+// actually the Stake lobby or a live casino table before doing anything -
+// everywhere else it stays completely inert (no timers, no audio, no DOM work).
 
 (function() {
     'use strict';
@@ -20,6 +28,7 @@
     const defaultSettings = {
         masterEnabled: true,
         soundEnabled: true,
+        volume: 0.8, // 0.0 - 1.0
         notifEnabled: true,
         telegramEnabled: false,
         telegramBotToken: '',
@@ -78,20 +87,22 @@
         osc.connect(gain);
         gain.connect(ctx.destination);
 
+        const vol = Math.max(0, Math.min(1, settings.volume ?? 0.8));
+
         if (toneType === 'betOpen') {
             osc.frequency.setValueAtTime(600, now);
             osc.frequency.setValueAtTime(900, now + 0.12);
             osc.frequency.setValueAtTime(600, now + 0.24);
             osc.frequency.setValueAtTime(900, now + 0.36);
-            gain.gain.setValueAtTime(0.35, now);
-            gain.gain.exponentialRampToValueAtTime(0.01, now + 0.5);
+            gain.gain.setValueAtTime(0.35 * vol, now);
+            gain.gain.exponentialRampToValueAtTime(0.01 * vol + 0.0001, now + 0.5);
             osc.start(now);
             osc.stop(now + 0.5);
         } else {
             osc.frequency.setValueAtTime(800, now);
             osc.frequency.exponentialRampToValueAtTime(1000, now + 0.1);
-            gain.gain.setValueAtTime(0.3, now);
-            gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+            gain.gain.setValueAtTime(0.3 * vol, now);
+            gain.gain.exponentialRampToValueAtTime(0.01 * vol + 0.0001, now + 0.3);
             osc.start(now);
             osc.stop(now + 0.3);
         }
@@ -319,6 +330,11 @@
             <label style="display:flex; align-items:center; gap:6px; margin-bottom:4px; cursor:pointer;">
                 <input type="checkbox" id="sn-sound"> Sound
             </label>
+            <label style="display:flex; align-items:center; gap:6px; margin-bottom:6px;">
+                <span style="width:16px;">🔊</span>
+                <input type="range" id="sn-volume" min="0" max="100" step="1" style="flex:1;">
+                <span id="sn-volume-label" style="width:28px; text-align:right; font-size:10px; color:#aaa;"></span>
+            </label>
             <label style="display:flex; align-items:center; gap:6px; margin-bottom:4px; cursor:pointer;">
                 <input type="checkbox" id="sn-notif"> Windows popups
             </label>
@@ -346,6 +362,8 @@
 
         const masterCb = panel.querySelector('#sn-master');
         const soundCb = panel.querySelector('#sn-sound');
+        const volumeSlider = panel.querySelector('#sn-volume');
+        const volumeLabel = panel.querySelector('#sn-volume-label');
         const notifCb = panel.querySelector('#sn-notif');
         const telegramCb = panel.querySelector('#sn-telegram');
         const telegramFields = panel.querySelector('#sn-telegram-fields');
@@ -355,6 +373,8 @@
 
         masterCb.checked = settings.masterEnabled;
         soundCb.checked = settings.soundEnabled;
+        volumeSlider.value = Math.round((settings.volume ?? 0.8) * 100);
+        volumeLabel.textContent = `${volumeSlider.value}%`;
         notifCb.checked = settings.notifEnabled;
         telegramCb.checked = settings.telegramEnabled;
         tokenInput.value = settings.telegramBotToken;
@@ -369,6 +389,11 @@
 
         masterCb.addEventListener('change', () => { settings.masterEnabled = masterCb.checked; saveSettings(settings); });
         soundCb.addEventListener('change', () => { settings.soundEnabled = soundCb.checked; saveSettings(settings); });
+        volumeSlider.addEventListener('input', () => {
+            settings.volume = Number(volumeSlider.value) / 100;
+            volumeLabel.textContent = `${volumeSlider.value}%`;
+            saveSettings(settings);
+        });
         notifCb.addEventListener('change', () => { settings.notifEnabled = notifCb.checked; saveSettings(settings); });
         telegramCb.addEventListener('change', () => {
             settings.telegramEnabled = telegramCb.checked;
@@ -414,18 +439,70 @@
     }
 
     // ---------------------------------------------------------------
-    // BOOT
+    // FRAME GUARD - with @match *://*/*, this script loads on every
+    // page/frame you visit. It must self-detect whether the current
+    // frame is either the Stake lobby page, or the actual live-casino
+    // game client (Evolution or Pragmatic Play - both load in a
+    // separate, randomized-domain iframe Tampermonkey has no other way
+    // to target by domain). Everywhere else it stays fully inert: no
+    // audio context, no observers, no DOM scanning, nothing.
     // ---------------------------------------------------------------
-    console.log('Stake Notifier: active (v3.0)');
-    logIframeAccess();
-    buildPanel();
+    function isStakeLobbyPage() {
+        try {
+            return location.hostname.endsWith('stake.com') && /\/casino\/(games|live)\//.test(location.pathname);
+        } catch (e) {
+            return false;
+        }
+    }
 
-    setInterval(runChecks, settings.checkIntervalMs);
+    // Generic markers present on both Evolution and Pragmatic Play live
+    // baccarat tables - deliberately provider-agnostic so it doesn't need
+    // separate rules per game studio.
+    function looksLikeLiveCasinoFrame() {
+        const text = document.body?.innerText || '';
+        if (!text || text.length < 20) return false;
+        const hasPlayerBanker = /\bPLAYER\b/.test(text) && /\bBANKER\b/.test(text);
+        const hasRoadWord = /Big Road|Good Roads|Bead Road/i.test(text);
+        const hasBetWord = /\bBET\b/i.test(text);
+        return hasPlayerBanker || (hasRoadWord && hasBetWord);
+    }
 
-    const observer = new MutationObserver(() => runChecks());
-    observer.observe(document.body, { childList: true, subtree: true });
+    function init(mode) {
+        console.log(`Stake Notifier: active (v3.1, mode=${mode}, frame=${location.hostname})`);
+        logIframeAccess();
+        buildPanel();
 
-    // If the user comes back to the tab on their own, stop flashing immediately
-    document.addEventListener('visibilitychange', () => { if (!isUserAway()) stopFlashing(); });
-    window.addEventListener('focus', () => { if (!isUserAway()) stopFlashing(); });
+        setInterval(runChecks, settings.checkIntervalMs);
+
+        const observer = new MutationObserver(() => runChecks());
+        observer.observe(document.body, { childList: true, subtree: true });
+
+        document.addEventListener('visibilitychange', () => { if (!isUserAway()) stopFlashing(); });
+        window.addEventListener('focus', () => { if (!isUserAway()) stopFlashing(); });
+    }
+
+    function bootWhenReady() {
+        if (isStakeLobbyPage()) {
+            init('lobby');
+            return;
+        }
+
+        // Any other frame (including the game provider's iframe, whatever
+        // its domain happens to be today): poll a few times for the table
+        // UI to render, then either activate or give up quietly for good.
+        let attempts = 0;
+        const maxAttempts = 30; // ~60s
+        const detector = setInterval(() => {
+            attempts++;
+            if (looksLikeLiveCasinoFrame()) {
+                clearInterval(detector);
+                init('game-frame');
+            } else if (attempts >= maxAttempts) {
+                clearInterval(detector);
+                // Not a relevant page - stays completely inert from here on.
+            }
+        }, 2000);
+    }
+
+    bootWhenReady();
 })();
