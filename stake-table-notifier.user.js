@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      4.1
+// @version      4.2
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -554,18 +554,21 @@
         const hasHotRoadsLabel = leafEls.some(el => /^hot roads$/i.test((el.textContent || '').trim()));
         const patternFilterActive = isPatternFilterActive();
 
-        console.log('Stake Notifier DEBUG SCAN', {
+        // Logged as a JSON string, not a raw object - some console
+        // readers/extensions collapse logged objects to just "Object"
+        // and never show their contents.
+        console.log('Stake Notifier DEBUG SCAN ' + JSON.stringify({
             provider,
             frameHostname: location.hostname,
             currentMode,
-            'All Tables label found (Pragmatic-style in-game tab)': hasAllTablesLabel,
-            'Good Roads label found (Pragmatic-style in-game tab)': hasGoodRoadsLabel,
-            'Good Roads tab active (true/false/null=unknown)': goodRoadsActive,
-            'Hot Roads label found (Evolution-style lobby filter)': hasHotRoadsLabel,
-            'Good/Hot Roads lobby filter active (true/false/null=unknown)': patternFilterActive,
-            'table names currently visible': tableNames,
-            'tables currently showing bet buttons': openBetTables
-        });
+            allTablesLabelFound: hasAllTablesLabel,
+            goodRoadsLabelFound: hasGoodRoadsLabel,
+            goodRoadsTabActive: goodRoadsActive,
+            hotRoadsLabelFound: hasHotRoadsLabel,
+            patternFilterActive: patternFilterActive,
+            tableNamesVisible: tableNames,
+            tablesShowingBetButtons: openBetTables
+        }, null, 2));
     }
 
     // ---------------------------------------------------------------
@@ -853,7 +856,7 @@
 
     function init(mode) {
         currentMode = mode;
-        console.log(`Stake Notifier: active (v4.1, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
+        console.log(`Stake Notifier: active (v4.2, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
         logIframeAccess();
 
         // Both the lobby page and the game iframe run this script. When a
