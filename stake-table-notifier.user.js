@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      3.2
+// @version      3.3
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -35,7 +35,8 @@
         telegramChatId: '',
         checkIntervalMs: 1500,
         escalationDelayMs: 8000,       // how long a bet window must stay open + you stay away before we buzz your phone
-        telegramMinIntervalMs: 60000   // don't phone-ping more than once per minute, even if multiple windows escalate
+        telegramMinIntervalMs: 60000,  // don't phone-ping more than once per minute, even if multiple windows escalate
+        panelCollapsed: false
     };
 
     function loadSettings() {
@@ -207,7 +208,7 @@
         return KEYWORDS.some(k => lower.includes(k));
     }
 
-    function checkForNewTables() {
+    function checkForNewTables(seedOnly) {
         const cards = document.querySelectorAll('[class*="card"], [class*="table"], .game-card, [role="button"]');
         let found = 0;
 
@@ -217,8 +218,9 @@
             const sig = getCardSignature(card);
             if (sig && !seenTables.has(sig)) {
                 seenTables.add(sig);
-                found++;
+                if (seedOnly) return; // baseline snapshot on page load - don't alert on what was already there
 
+                found++;
                 const originalBg = card.style.backgroundColor;
                 card.style.backgroundColor = 'rgba(76, 175, 80, 0.3)';
                 setTimeout(() => { card.style.backgroundColor = originalBg; }, 1000);
@@ -268,8 +270,18 @@
         sendTelegram('Bet window still open on Stake and you have not acted - go check.');
     }
 
-    function checkForOpenBets() {
+    function checkForOpenBets(seedOnly) {
         const isOpenNow = !!findOpenBetButton();
+
+        if (seedOnly) {
+            // Baseline snapshot on page load/refresh - if betting already
+            // happens to be open when the page loads, don't alert; only a
+            // later open->closed->open transition should fire.
+            betWindowOpen = isOpenNow;
+            betOpenConsecutiveHits = isOpenNow ? BET_HITS_TO_CONFIRM : 0;
+            return;
+        }
+
         betOpenConsecutiveHits = isOpenNow ? betOpenConsecutiveHits + 1 : 0;
         const confirmedOpen = betOpenConsecutiveHits >= BET_HITS_TO_CONFIRM;
 
@@ -288,13 +300,17 @@
         }
     }
 
+    let firstRunDone = false;
+
     function runChecks() {
         if (!settings.masterEnabled) { stopFlashing(); return; }
+        const seedOnly = !firstRunDone;
         if (currentMode === 'lobby') {
-            checkForNewTables();
+            checkForNewTables(seedOnly);
         } else if (currentMode === 'game-frame') {
-            checkForOpenBets();
+            checkForOpenBets(seedOnly);
         }
+        firstRunDone = true;
     }
 
     // ---------------------------------------------------------------
@@ -321,53 +337,94 @@
     // bottom-right notification popups)
     // ---------------------------------------------------------------
     function buildPanel() {
+        const styleTag = document.createElement('style');
+        styleTag.textContent = `
+            #stake-notifier-panel * { box-sizing: border-box; }
+            #stake-notifier-panel {
+                position: fixed; bottom: 14px; left: 14px; z-index: 999999;
+                background: #14151c; color: #e8e9ee;
+                font: 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                border-radius: 10px; box-shadow: 0 4px 18px rgba(0,0,0,0.45);
+                border: 1px solid rgba(255,255,255,0.08);
+                width: 240px; overflow: hidden;
+            }
+            #sn-header {
+                display: flex; align-items: center; gap: 8px;
+                padding: 10px 12px; cursor: pointer; user-select: none;
+            }
+            #sn-dot { width: 7px; height: 7px; border-radius: 50%; background: #4caf50; flex-shrink: 0; }
+            #sn-title { font-weight: 600; font-size: 12.5px; flex: 1; }
+            #sn-toggle-arrow { font-size: 10px; color: #8a8d99; }
+            #sn-body { padding: 0 12px 12px 12px; }
+            .sn-section { padding: 10px 0; border-top: 1px solid rgba(255,255,255,0.07); }
+            .sn-section:first-child { border-top: none; padding-top: 2px; }
+            .sn-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; cursor: pointer; }
+            .sn-row input[type="checkbox"] { accent-color: #4caf50; width: 14px; height: 14px; cursor: pointer; }
+            .sn-sub-row { display: flex; align-items: center; gap: 8px; padding: 4px 0 4px 22px; }
+            .sn-sub-row input[type="range"] { flex: 1; accent-color: #4caf50; }
+            #sn-volume-label { width: 30px; text-align: right; font-size: 10px; color: #8a8d99; }
+            .sn-field { width: 100%; margin-top: 6px; font-size: 11px; padding: 6px 8px;
+                background: #1e2029; border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; color: #e8e9ee; }
+            .sn-field::placeholder { color: #6b6e7a; }
+            .sn-fields-wrap { padding-left: 22px; }
+            .sn-btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+            .sn-btn {
+                font-size: 11px; padding: 6px 4px; cursor: pointer; border-radius: 6px;
+                background: #23252f; border: 1px solid rgba(255,255,255,0.1); color: #e8e9ee;
+            }
+            .sn-btn:hover { background: #2b2e3a; }
+            .sn-btn-full { grid-column: 1 / -1; }
+            #sn-status { margin-top: 8px; font-size: 10px; color: #6b6e7a; }
+        `;
+        document.head.appendChild(styleTag);
+
         const panel = document.createElement('div');
         panel.id = 'stake-notifier-panel';
-        panel.style.cssText = `
-            position: fixed; bottom: 12px; left: 12px; z-index: 999999;
-            background: #1a1d29; color: #fff; font: 12px/1.4 sans-serif;
-            border-radius: 8px; padding: 10px 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.5);
-            width: 230px; opacity: 0.92;
-        `;
 
         panel.innerHTML = `
-            <div style="font-weight:600; margin-bottom:6px;">Stake Notifier</div>
-            <label style="display:flex; align-items:center; gap:6px; margin-bottom:4px; cursor:pointer;">
-                <input type="checkbox" id="sn-master"> Enabled
-            </label>
-            <label style="display:flex; align-items:center; gap:6px; margin-bottom:4px; cursor:pointer;">
-                <input type="checkbox" id="sn-sound"> Sound
-            </label>
-            <label style="display:flex; align-items:center; gap:6px; margin-bottom:6px;">
-                <span style="width:16px;">🔊</span>
-                <input type="range" id="sn-volume" min="0" max="100" step="1" style="flex:1;">
-                <span id="sn-volume-label" style="width:28px; text-align:right; font-size:10px; color:#aaa;"></span>
-            </label>
-            <label style="display:flex; align-items:center; gap:6px; margin-bottom:4px; cursor:pointer;">
-                <input type="checkbox" id="sn-notif"> Windows popups
-            </label>
-            <label style="display:flex; align-items:center; gap:6px; margin-bottom:6px; cursor:pointer;">
-                <input type="checkbox" id="sn-telegram"> Phone push (Telegram)
-            </label>
-            <div id="sn-telegram-fields" style="display:none; margin-bottom:8px;">
-                <input id="sn-tg-token" type="password" placeholder="Bot token" style="width:100%; margin-bottom:4px; box-sizing:border-box; font-size:11px; padding:3px;">
-                <input id="sn-tg-chatid" type="text" placeholder="Chat ID" style="width:100%; box-sizing:border-box; font-size:11px; padding:3px;">
+            <div id="sn-header">
+                <div id="sn-dot"></div>
+                <div id="sn-title">Stake Notifier</div>
+                <div id="sn-toggle-arrow">▾</div>
             </div>
-            <div style="display:flex; gap:6px; margin-bottom:6px;">
-                <button id="sn-enable-notif" style="flex:1; font-size:11px; padding:4px; cursor:pointer;">Grant permission</button>
+            <div id="sn-body">
+                <div class="sn-section">
+                    <label class="sn-row"><input type="checkbox" id="sn-master"> Enabled</label>
+                    <label class="sn-row"><input type="checkbox" id="sn-sound"> Sound</label>
+                    <div class="sn-sub-row">
+                        <span>🔊</span>
+                        <input type="range" id="sn-volume" min="0" max="100" step="1">
+                        <span id="sn-volume-label"></span>
+                    </div>
+                    <label class="sn-row"><input type="checkbox" id="sn-notif"> Windows popups</label>
+                </div>
+
+                <div class="sn-section">
+                    <label class="sn-row"><input type="checkbox" id="sn-telegram"> Phone push (Telegram)</label>
+                    <div id="sn-telegram-fields" class="sn-fields-wrap" style="display:none;">
+                        <input id="sn-tg-token" class="sn-field" type="password" placeholder="Bot token">
+                        <input id="sn-tg-chatid" class="sn-field" type="text" placeholder="Chat ID">
+                    </div>
+                </div>
+
+                <div class="sn-section">
+                    <button id="sn-enable-notif" class="sn-btn sn-btn-full" style="margin-bottom:6px;">Grant notification permission</button>
+                    <div class="sn-btn-grid">
+                        <button id="sn-test-sound" class="sn-btn">Test sound</button>
+                        <button id="sn-test-popup" class="sn-btn">Test popup</button>
+                        <button id="sn-test-telegram" class="sn-btn sn-btn-full">Test phone push</button>
+                    </div>
+                    <div id="sn-status"></div>
+                </div>
             </div>
-            <div style="display:flex; gap:6px; margin-bottom:6px;">
-                <button id="sn-test-sound" style="flex:1; font-size:11px; padding:4px; cursor:pointer;">Test sound</button>
-                <button id="sn-test-popup" style="flex:1; font-size:11px; padding:4px; cursor:pointer;">Test popup</button>
-            </div>
-            <div style="display:flex; gap:6px;">
-                <button id="sn-test-telegram" style="flex:1; font-size:11px; padding:4px; cursor:pointer;">Test phone push</button>
-            </div>
-            <div id="sn-status" style="margin-top:6px; font-size:10px; color:#aaa;"></div>
         `;
 
         document.body.appendChild(panel);
 
+        const header = panel.querySelector('#sn-header');
+        const toggleArrow = panel.querySelector('#sn-toggle-arrow');
+        const body = panel.querySelector('#sn-body');
+        const dot = panel.querySelector('#sn-dot');
         const masterCb = panel.querySelector('#sn-master');
         const soundCb = panel.querySelector('#sn-sound');
         const volumeSlider = panel.querySelector('#sn-volume');
@@ -378,6 +435,18 @@
         const tokenInput = panel.querySelector('#sn-tg-token');
         const chatIdInput = panel.querySelector('#sn-tg-chatid');
         const status = panel.querySelector('#sn-status');
+
+        function applyCollapsed() {
+            body.style.display = settings.panelCollapsed ? 'none' : 'block';
+            toggleArrow.textContent = settings.panelCollapsed ? '▸' : '▾';
+        }
+
+        header.addEventListener('click', () => {
+            settings.panelCollapsed = !settings.panelCollapsed;
+            saveSettings(settings);
+            applyCollapsed();
+        });
+        applyCollapsed();
 
         masterCb.checked = settings.masterEnabled;
         soundCb.checked = settings.soundEnabled;
@@ -391,11 +460,16 @@
 
         function refreshStatus() {
             const perm = ('Notification' in window) ? Notification.permission : 'unsupported';
-            status.textContent = `Notif permission: ${perm}`;
+            status.textContent = `Notification permission: ${perm}`;
         }
         refreshStatus();
 
-        masterCb.addEventListener('change', () => { settings.masterEnabled = masterCb.checked; saveSettings(settings); });
+        function updateDot() {
+            dot.style.background = settings.masterEnabled ? '#4caf50' : '#5a5d68';
+        }
+        updateDot();
+
+        masterCb.addEventListener('change', () => { settings.masterEnabled = masterCb.checked; saveSettings(settings); updateDot(); });
         soundCb.addEventListener('change', () => { settings.soundEnabled = soundCb.checked; saveSettings(settings); });
         volumeSlider.addEventListener('input', () => {
             settings.volume = Number(volumeSlider.value) / 100;
@@ -479,9 +553,17 @@
 
     function init(mode) {
         currentMode = mode;
-        console.log(`Stake Notifier: active (v3.2, mode=${mode}, frame=${location.hostname})`);
+        console.log(`Stake Notifier: active (v3.3, mode=${mode}, frame=${location.hostname})`);
         logIframeAccess();
-        buildPanel();
+
+        // Both the lobby page and the game iframe run this script, and each
+        // would otherwise build its own panel - showing two boxes on screen.
+        // Only the game view (where sound/popup/phone-push actually matter)
+        // gets a visible panel; the lobby's new-table detector runs quietly
+        // in the background with no UI.
+        if (mode === 'game-frame') {
+            buildPanel();
+        }
 
         setInterval(runChecks, settings.checkIntervalMs);
 
