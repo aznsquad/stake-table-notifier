@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      4.5
+// @version      4.6
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -41,12 +41,17 @@
         telegramEnabled: false,
         telegramBotToken: '',
         telegramChatId: '',
-        checkIntervalMs: 1500,
-        escalationDelayMs: 8000,       // how long a bet window must stay open + you stay away before we buzz your phone
-        telegramMinIntervalMs: 60000,  // don't phone-ping more than once per minute, even if multiple windows escalate
         panelCollapsed: false,
         panelPos: null // { left, top } in px once the user has dragged it; null = default bottom-left
     };
+
+    // Tuning constants - deliberately NOT part of persisted settings, since
+    // there's no UI to change them and a value saved under an old default
+    // would otherwise silently stick around forever even after the default
+    // itself is tightened later.
+    const CHECK_INTERVAL_MS = 500;
+    const ESCALATION_DELAY_MS = 8000;      // how long a bet window must stay open + you stay away before we buzz your phone
+    const TELEGRAM_MIN_INTERVAL_MS = 60000; // don't phone-ping more than once per minute, even if multiple windows escalate
 
     const hasGM = typeof GM_getValue === 'function' && typeof GM_setValue === 'function';
 
@@ -180,7 +185,7 @@
         }
 
         const now = Date.now();
-        if (!bypassRateLimit && now - lastTelegramSentAt < settings.telegramMinIntervalMs) {
+        if (!bypassRateLimit && now - lastTelegramSentAt < TELEGRAM_MIN_INTERVAL_MS) {
             return Promise.resolve({ ok: false, reason: 'rate-limited, try again shortly' });
         }
         lastTelegramSentAt = now;
@@ -473,7 +478,7 @@
                 showPopup('Bet window open', `${key || 'A table'} is accepting bets right now.`);
                 startFlashing();
                 console.log('Stake Notifier: bet window opened for', key);
-                setTimeout(() => escalateToPhone(key), settings.escalationDelayMs);
+                setTimeout(() => escalateToPhone(key), ESCALATION_DELAY_MS);
             }
         });
 
@@ -898,7 +903,7 @@
 
     function init(mode) {
         currentMode = mode;
-        console.log(`Stake Notifier: active (v4.5, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
+        console.log(`Stake Notifier: active (v4.6, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
         logIframeAccess();
 
         // Both the lobby page and the game iframe run this script, but the
@@ -911,10 +916,26 @@
             buildPanel();
         }
 
-        setInterval(runChecks, settings.checkIntervalMs);
+        setInterval(runChecks, CHECK_INTERVAL_MS);
 
-        const observer = new MutationObserver(() => runChecks());
-        observer.observe(document.body, { childList: true, subtree: true });
+        // Watch text/attribute changes too, not just node add/remove - a
+        // table appearing under Good/Hot Roads is often a re-render of
+        // existing DOM (React/Svelte reusing nodes) rather than a fresh
+        // node being inserted, which childList-only would miss entirely
+        // until the next poll tick. Throttled to at most once every 150ms
+        // so a burst of unrelated mutations (video/canvas/countdown ticks)
+        // can't turn this into a tight synchronous loop.
+        let mutationThrottleTimer = null;
+        const observer = new MutationObserver(() => {
+            if (mutationThrottleTimer) return;
+            mutationThrottleTimer = setTimeout(() => {
+                mutationThrottleTimer = null;
+                runChecks();
+            }, 150);
+        });
+        observer.observe(document.body, {
+            childList: true, subtree: true, characterData: true, attributes: true
+        });
 
         document.addEventListener('visibilitychange', () => { if (!isUserAway()) stopFlashing(); });
         window.addEventListener('focus', () => { if (!isUserAway()) stopFlashing(); });
