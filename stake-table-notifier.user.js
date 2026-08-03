@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      3.6
+// @version      3.7
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
-// @grant        none
+// @grant        GM_setValue
+// @grant        GM_getValue
 // @run-at       document-end
 // ==/UserScript==
 
@@ -22,7 +23,14 @@
     'use strict';
 
     // ---------------------------------------------------------------
-    // SETTINGS (persisted in localStorage, editable via the on-page panel)
+    // SETTINGS. Stored via Tampermonkey's GM_setValue/GM_getValue, NOT
+    // localStorage - localStorage is scoped per-origin, and the game
+    // iframe loads from a randomized, rotating domain, so localStorage
+    // would silently reset (position, volume, Telegram token, everything)
+    // whenever that domain changes between sessions. GM storage is scoped
+    // to the script itself, so it's the same data no matter which domain
+    // the game iframe happens to load from. Falls back to localStorage
+    // only if GM_setValue/GM_getValue are somehow unavailable.
     // ---------------------------------------------------------------
     const STORAGE_KEY = 'stakeNotifierSettings_v3';
     const defaultSettings = {
@@ -40,9 +48,11 @@
         panelPos: null // { left, top } in px once the user has dragged it; null = default bottom-left
     };
 
+    const hasGM = typeof GM_getValue === 'function' && typeof GM_setValue === 'function';
+
     function loadSettings() {
         try {
-            const raw = localStorage.getItem(STORAGE_KEY);
+            const raw = hasGM ? GM_getValue(STORAGE_KEY, null) : localStorage.getItem(STORAGE_KEY);
             return raw ? { ...defaultSettings, ...JSON.parse(raw) } : { ...defaultSettings };
         } catch (e) {
             return { ...defaultSettings };
@@ -50,7 +60,12 @@
     }
 
     function saveSettings(s) {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
+        const raw = JSON.stringify(s);
+        if (hasGM) {
+            GM_setValue(STORAGE_KEY, raw);
+        } else {
+            try { localStorage.setItem(STORAGE_KEY, raw); } catch (e) { /* ignore */ }
+        }
     }
 
     let settings = loadSettings();
@@ -696,7 +711,7 @@
 
     function init(mode) {
         currentMode = mode;
-        console.log(`Stake Notifier: active (v3.6, mode=${mode}, frame=${location.hostname})`);
+        console.log(`Stake Notifier: active (v3.7, mode=${mode}, frame=${location.hostname})`);
         logIframeAccess();
 
         // Both the lobby page and the game iframe run this script, and each
