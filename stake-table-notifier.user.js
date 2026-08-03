@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      3.9
+// @version      4.0
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -242,7 +242,38 @@
         return KEYWORDS.some(k => lower.includes(k));
     }
 
+    // Evolution and Pragmatic use the same underlying idea (surface
+    // tables matching a favourable pattern) but expose it completely
+    // differently:
+    //  - Pragmatic: a "Good Roads" TAB inside an already-open Multiplay
+    //    game (handled separately, inside the game-frame section below).
+    //  - Evolution: a "Hot Roads" FILTER BUTTON on the outer lobby page
+    //    itself, which re-sorts/filters which game tiles appear in the
+    //    grid - there's no per-game tab at all.
+    // This checks the lobby-level filter row for either label, and
+    // compares its text color against a neutral sibling filter (e.g.
+    // "Speed") to tell whether it's the one currently active. Returns
+    // null if we can't find enough of the filter row to tell.
+    function isPatternFilterActive() {
+        const leafEls = Array.from(document.querySelectorAll('button, div, span'))
+            .filter(el => el.children.length === 0);
+        const patternEl = leafEls.find(el => /^(good roads|hot roads)$/i.test((el.textContent || '').trim()));
+        const neutralEl = leafEls.find(el => /^speed$/i.test((el.textContent || '').trim()));
+        if (!patternEl || !neutralEl) return null;
+
+        function colorOf(el) {
+            const target = el.closest('button') || el;
+            return getComputedStyle(target).color;
+        }
+        return colorOf(patternEl) !== colorOf(neutralEl);
+    }
+
     function checkForNewTables(seedOnly) {
+        // Only alert for tables surfaced by the Good/Hot Roads filter,
+        // not every table on the lobby page. If we can't tell (null),
+        // proceed anyway rather than going silently dead.
+        if (isPatternFilterActive() === false) return;
+
         const cards = document.querySelectorAll('[class*="card"], [class*="table"], .game-card, [role="button"]');
         let found = 0;
 
@@ -510,14 +541,18 @@
             .filter(el => el.children.length === 0);
         const hasAllTablesLabel = leafEls.some(el => /^all tables$/i.test((el.textContent || '').trim()));
         const hasGoodRoadsLabel = leafEls.some(el => /^good roads$/i.test((el.textContent || '').trim()));
+        const hasHotRoadsLabel = leafEls.some(el => /^hot roads$/i.test((el.textContent || '').trim()));
+        const patternFilterActive = isPatternFilterActive();
 
         console.log('Stake Notifier DEBUG SCAN', {
             provider,
             frameHostname: location.hostname,
             currentMode,
-            'All Tables label found': hasAllTablesLabel,
-            'Good Roads label found': hasGoodRoadsLabel,
+            'All Tables label found (Pragmatic-style in-game tab)': hasAllTablesLabel,
+            'Good Roads label found (Pragmatic-style in-game tab)': hasGoodRoadsLabel,
             'Good Roads tab active (true/false/null=unknown)': goodRoadsActive,
+            'Hot Roads label found (Evolution-style lobby filter)': hasHotRoadsLabel,
+            'Good/Hot Roads lobby filter active (true/false/null=unknown)': patternFilterActive,
             'table names currently visible': tableNames,
             'tables currently showing bet buttons': openBetTables
         });
@@ -808,7 +843,7 @@
 
     function init(mode) {
         currentMode = mode;
-        console.log(`Stake Notifier: active (v3.9, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
+        console.log(`Stake Notifier: active (v4.0, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
         logIframeAccess();
 
         // Both the lobby page and the game iframe run this script, and each
