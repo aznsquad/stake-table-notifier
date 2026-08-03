@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      3.8
+// @version      3.9
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -484,6 +484,45 @@
         });
     }
 
+    // Evolution and Pragmatic render their tables differently enough
+    // (Pragmatic's "Multiplay" grid vs Evolution's single-table + side
+    // panel) that detection may need to diverge per-provider eventually.
+    // For now this is used for logging/diagnostics so issues reported on
+    // one provider can be told apart from the other.
+    function detectProvider() {
+        const text = (document.body?.innerText || '').toUpperCase();
+        if (/PRAGMATIC/.test(text)) return 'pragmatic';
+        if (/EVOLUTION/.test(text)) return 'evolution';
+        return 'unknown';
+    }
+
+    // On-demand dump of exactly what the detectors currently see - click
+    // "Debug scan" in the panel while looking at the table in question,
+    // then paste the console output back so detection can be tuned
+    // against the real markup instead of guessing blind.
+    function runDebugScan() {
+        const provider = detectProvider();
+        const goodRoadsActive = isGoodRoadsTabActive();
+        const tableNames = [...findVisibleTableNames()];
+        const openBetTables = [...findActiveBetTables()];
+
+        const leafEls = Array.from(document.querySelectorAll('button, div, span'))
+            .filter(el => el.children.length === 0);
+        const hasAllTablesLabel = leafEls.some(el => /^all tables$/i.test((el.textContent || '').trim()));
+        const hasGoodRoadsLabel = leafEls.some(el => /^good roads$/i.test((el.textContent || '').trim()));
+
+        console.log('Stake Notifier DEBUG SCAN', {
+            provider,
+            frameHostname: location.hostname,
+            currentMode,
+            'All Tables label found': hasAllTablesLabel,
+            'Good Roads label found': hasGoodRoadsLabel,
+            'Good Roads tab active (true/false/null=unknown)': goodRoadsActive,
+            'table names currently visible': tableNames,
+            'tables currently showing bet buttons': openBetTables
+        });
+    }
+
     // ---------------------------------------------------------------
     // UI PANEL (bottom-left, so it never collides with Windows'
     // bottom-right notification popups)
@@ -566,6 +605,7 @@
                         <button id="sn-test-sound" class="sn-btn">Test sound</button>
                         <button id="sn-test-popup" class="sn-btn">Test popup</button>
                         <button id="sn-test-telegram" class="sn-btn sn-btn-full">Test phone push</button>
+                        <button id="sn-debug-scan" class="sn-btn sn-btn-full">Debug scan (check console)</button>
                     </div>
                     <div id="sn-status"></div>
                 </div>
@@ -729,6 +769,10 @@
                 ? 'Sent - check your phone.'
                 : `Failed: ${result.reason}`;
         });
+        panel.querySelector('#sn-debug-scan').addEventListener('click', () => {
+            runDebugScan();
+            status.textContent = 'Debug info logged - open console (F12) to view.';
+        });
     }
 
     // ---------------------------------------------------------------
@@ -764,7 +808,7 @@
 
     function init(mode) {
         currentMode = mode;
-        console.log(`Stake Notifier: active (v3.8, mode=${mode}, frame=${location.hostname})`);
+        console.log(`Stake Notifier: active (v3.9, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
         logIframeAccess();
 
         // Both the lobby page and the game iframe run this script, and each
