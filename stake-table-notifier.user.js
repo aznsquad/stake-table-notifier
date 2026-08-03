@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      3.1
+// @version      3.2
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -190,12 +190,10 @@
     }
 
     // ---------------------------------------------------------------
-    // TABLE / BET DETECTION
+    // LOBBY: new-table detection (only ever runs on the stake.com lobby
+    // page, never inside an actual game frame - see runChecks below)
     // ---------------------------------------------------------------
     const seenTables = new Set();
-    // key -> { openedAt, escalated, repeatTimerId }
-    const betOpenState = new Map();
-
     const KEYWORDS = ['baccarat', 'speed', 'dragon', 'tiger', 'sic bo', 'andar', 'teen patti', 'roulette', 'blackjack', 'mega'];
 
     function getCardSignature(el) {
@@ -234,59 +232,69 @@
         }
     }
 
-    // Fires the "still open, you haven't acted" escalation to your phone.
-    function escalateToPhone(key) {
-        const state = betOpenState.get(key);
-        if (!state || state.escalated) return;
-        if (!isUserAway()) return; // they came back on their own, no need to buzz the phone
-        state.escalated = true;
-        sendTelegram(`Bet window still open on Stake (${key || 'a table'}) and you haven't acted - go check.`);
+    // ---------------------------------------------------------------
+    // GAME FRAME: bet-window detection (only runs inside the actual
+    // live table iframe - one frame = one table, so this is simple
+    // single-state tracking, not a multi-key map). Fires exactly once
+    // on the open->closed->open edge, not on every re-render, and never
+    // on dealt cards or on placing a bet - only on the window opening.
+    // ---------------------------------------------------------------
+    let betWindowOpen = false;
+    let betWindowEscalated = false;
+    let betOpenConsecutiveHits = 0;
+    const BET_HITS_TO_CONFIRM = 2; // require 2 consecutive polls agreeing before firing, to kill one-frame flicker false positives
+
+    // Looks specifically for a real, enabled, clickable "Bet" button -
+    // not bet-amount chips, not "bet placed" confirmation text, not card
+    // elements. If this still misses or over-fires on your table, tell
+    // me exactly what text/element you see when betting is open/closed
+    // and I'll tighten this further.
+    function findOpenBetButton() {
+        const els = Array.from(document.querySelectorAll('button, [role="button"]'));
+        return els.find(el => {
+            const t = (el.textContent || '').trim();
+            if (!t || t.length > 20) return false;
+            if (!/^(place\s*)?bet\b/i.test(t)) return false;
+            if (el.disabled) return false;
+            if (/disabled|inactive/i.test(el.className || '')) return false;
+            return true;
+        });
     }
 
-    // Heuristic bet-window detector. If this misses your table layout,
-    // open the console (F12), watch what it logs, and tell me what the
-    // actual countdown/bet-button markup looks like so I can tighten it.
+    function escalateToPhone() {
+        if (!betWindowOpen || betWindowEscalated) return;
+        if (!isUserAway()) return; // they came back on their own, no need to buzz the phone
+        betWindowEscalated = true;
+        sendTelegram('Bet window still open on Stake and you have not acted - go check.');
+    }
+
     function checkForOpenBets() {
-        const betButtons = Array.from(document.querySelectorAll('button, [role="button"], div, span'))
-            .filter(el => /^bet\s*\$?\d*/i.test(el.textContent?.trim() || '') && el.textContent.trim().length < 20);
+        const isOpenNow = !!findOpenBetButton();
+        betOpenConsecutiveHits = isOpenNow ? betOpenConsecutiveHits + 1 : 0;
+        const confirmedOpen = betOpenConsecutiveHits >= BET_HITS_TO_CONFIRM;
 
-        const countdownEls = Array.from(document.querySelectorAll('div, span'))
-            .filter(el => /^\d{1,2}$/.test(el.textContent?.trim() || ''));
-
-        const candidates = [...betButtons, ...countdownEls];
-
-        const presentKeys = new Set();
-
-        candidates.forEach(el => {
-            const container = el.closest('[class*="table"], [class*="panel"], [class*="game"]') || el.parentElement;
-            if (!container) return;
-            const key = getCardSignature(container) || container.className || 'unknown';
-            presentKeys.add(key);
-
-            if (!betOpenState.has(key)) {
-                betOpenState.set(key, { openedAt: Date.now(), escalated: false });
-
-                playSound('betOpen');
-                showPopup('Bet window open', 'A table is accepting bets right now.');
-                startFlashing();
-                console.log('Stake Notifier: bet window opened for', key);
-
-                setTimeout(() => escalateToPhone(key), settings.escalationDelayMs);
-            }
-        });
-
-        // Clear state for windows that closed, so the next open re-fires from scratch
-        for (const key of betOpenState.keys()) {
-            if (!presentKeys.has(key)) betOpenState.delete(key);
+        if (confirmedOpen && !betWindowOpen) {
+            betWindowOpen = true;
+            betWindowEscalated = false;
+            playSound('betOpen');
+            showPopup('Bet window open', 'It is time to bet.');
+            startFlashing();
+            console.log('Stake Notifier: bet window opened');
+            setTimeout(escalateToPhone, settings.escalationDelayMs);
+        } else if (!isOpenNow && betWindowOpen) {
+            betWindowOpen = false;
+            betWindowEscalated = false;
+            stopFlashing();
         }
-
-        if (betOpenState.size === 0) stopFlashing();
     }
 
     function runChecks() {
         if (!settings.masterEnabled) { stopFlashing(); return; }
-        checkForNewTables();
-        checkForOpenBets();
+        if (currentMode === 'lobby') {
+            checkForNewTables();
+        } else if (currentMode === 'game-frame') {
+            checkForOpenBets();
+        }
     }
 
     // ---------------------------------------------------------------
@@ -467,8 +475,11 @@
         return hasPlayerBanker || (hasRoadWord && hasBetWord);
     }
 
+    let currentMode = null;
+
     function init(mode) {
-        console.log(`Stake Notifier: active (v3.1, mode=${mode}, frame=${location.hostname})`);
+        currentMode = mode;
+        console.log(`Stake Notifier: active (v3.2, mode=${mode}, frame=${location.hostname})`);
         logIframeAccess();
         buildPanel();
 
