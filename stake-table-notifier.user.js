@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      3.7
+// @version      3.8
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -350,6 +350,58 @@
         sendTelegram(`Bet window open on Stake (${key}) and you have not acted - go check.`);
     }
 
+    // ---------------------------------------------------------------
+    // GAME FRAME: "new Good Roads table appeared" detection. This is
+    // the original ask - a sound when a table shows up matching your
+    // preferred pattern - but it has to run HERE, inside the game
+    // iframe, because the Good Roads list itself lives here, not on
+    // the outer stake.com lobby page (that was the bug: the old
+    // lobby-only detector was watching the wrong frame entirely).
+    // Works for both Evolution and Pragmatic since it just looks for
+    // table-name headings, not provider-specific markup.
+    // ---------------------------------------------------------------
+    const seenGoodRoadsTables = new Set();
+
+    function findVisibleTableNames() {
+        const leafEls = Array.from(document.querySelectorAll('div, span, h1, h2, h3, h4'))
+            .filter(el => el.children.length === 0);
+        const names = new Set();
+        leafEls.forEach(el => {
+            const t = (el.textContent || '').trim();
+            if (/^[A-Za-z][A-Za-z0-9\s]{2,40}(Baccarat|Dragon Tiger)[A-Za-z0-9\s]{0,10}$/i.test(t)) {
+                names.add(t);
+            }
+        });
+        return names;
+    }
+
+    function checkForNewGoodRoadsTables(seedOnly) {
+        const goodRoadsActive = isGoodRoadsTabActive();
+        if (goodRoadsActive === false) return; // "All Tables" active - not what this feature is for
+
+        const namesNow = findVisibleTableNames();
+        let found = 0;
+
+        namesNow.forEach(name => {
+            if (!seenGoodRoadsTables.has(name)) {
+                seenGoodRoadsTables.add(name);
+                if (!seedOnly) found++;
+            }
+        });
+
+        // A table that's no longer shown has dropped out of Good Roads -
+        // let it re-alert if it reappears later.
+        for (const name of seenGoodRoadsTables) {
+            if (!namesNow.has(name)) seenGoodRoadsTables.delete(name);
+        }
+
+        if (found > 0) {
+            playSound('newTable');
+            showPopup('Good Roads table found', `${found} table(s) now match your preferred pattern.`);
+            console.log('Stake Notifier: new Good Roads table(s) detected', [...namesNow]);
+        }
+    }
+
     function checkForOpenBets(seedOnly) {
         const goodRoadsActive = isGoodRoadsTabActive();
         if (goodRoadsActive === false) {
@@ -407,6 +459,7 @@
         if (currentMode === 'lobby') {
             checkForNewTables(seedOnly);
         } else if (currentMode === 'game-frame') {
+            checkForNewGoodRoadsTables(seedOnly);
             checkForOpenBets(seedOnly);
         }
         firstRunDone = true;
@@ -711,7 +764,7 @@
 
     function init(mode) {
         currentMode = mode;
-        console.log(`Stake Notifier: active (v3.7, mode=${mode}, frame=${location.hostname})`);
+        console.log(`Stake Notifier: active (v3.8, mode=${mode}, frame=${location.hostname})`);
         logIframeAccess();
 
         // Both the lobby page and the game iframe run this script, and each
