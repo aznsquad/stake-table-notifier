@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      4.4
+// @version      4.5
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -295,6 +295,7 @@
         if (found > 0) {
             playSound('newTable');
             showPopup('New table available', `${found} new table(s) just showed up in the multiview.`);
+            sendTelegram(`${found} new table(s) just showed up matching your Good/Hot Roads pattern.`);
             console.log(`Stake Notifier: ${found} new table(s) detected`);
         }
     }
@@ -429,6 +430,7 @@
         if (found > 0) {
             playSound('newTable');
             showPopup('Good Roads table found', `${found} table(s) now match your preferred pattern.`);
+            sendTelegram(`${found} table(s) now match your Good Roads pattern - go check.`);
             console.log('Stake Notifier: new Good Roads table(s) detected', [...namesNow]);
         }
     }
@@ -485,6 +487,14 @@
     let firstRunDone = false;
 
     function runChecks() {
+        // The lobby and game-frame each keep their own in-memory settings
+        // object, loaded once at boot. Without this, toggling something in
+        // the lobby panel would update storage but the already-running
+        // game frame (where the actual alerting happens) would keep using
+        // whatever it read at its own boot time, forever - so re-sync from
+        // storage on every check, not just once.
+        Object.assign(settings, loadSettings());
+
         if (!settings.masterEnabled) { stopFlashing(); return; }
         const seedOnly = !firstRunDone;
         if (currentMode === 'lobby') {
@@ -575,42 +585,42 @@
                 font: 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
                 border-radius: 10px; box-shadow: 0 4px 18px rgba(0,0,0,0.45);
                 border: 1px solid rgba(255,255,255,0.08);
-                width: 240px; overflow: hidden;
+                width: 200px; overflow: hidden;
             }
             #sn-header {
                 display: flex; align-items: center; gap: 8px;
-                padding: 10px 12px; cursor: grab; user-select: none; touch-action: none;
+                padding: 9px 10px; cursor: grab; user-select: none; touch-action: none;
             }
             #sn-header:active { cursor: grabbing; }
             #sn-dot { width: 7px; height: 7px; border-radius: 50%; background: #4caf50; flex-shrink: 0; }
-            #sn-title { font-weight: 600; font-size: 12.5px; flex: 1; }
+            #sn-title { font-weight: 600; font-size: 12px; flex: 1; }
             #sn-toggle-arrow { font-size: 10px; color: #8a8d99; }
-            #sn-body { padding: 0 12px 12px 12px; }
-            .sn-section { padding: 10px 0; border-top: 1px solid rgba(255,255,255,0.07); }
-            .sn-section:first-child { border-top: none; padding-top: 2px; }
-            .sn-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; cursor: pointer; }
-            /* Custom-drawn checkbox, not relying on native appearance - the
-               host page's own CSS resets (e.g. appearance:none on all
-               inputs) can otherwise make native checkboxes render as
-               completely invisible even though they still work. */
-            .sn-checkbox-wrap { position: relative; width: 14px; height: 14px; flex-shrink: 0; }
-            .sn-checkbox-wrap input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
-            .sn-checkbox-box {
-                position: absolute; inset: 0; border: 1px solid rgba(255,255,255,0.4);
-                border-radius: 3px; background: #1e2029; pointer-events: none;
+            #sn-body { padding: 0 10px 10px 10px; }
+
+            /* Compact icon toggles - one row covers Enabled/Sound/Popups/
+               Telegram, replacing four separate checkbox rows. */
+            #sn-toggle-row { display: flex; align-items: center; gap: 5px; padding-top: 2px; }
+            .sn-icon-btn {
+                width: 26px; height: 26px; border-radius: 6px; flex-shrink: 0;
+                display: flex; align-items: center; justify-content: center;
+                background: #1e2029; border: 1px solid rgba(255,255,255,0.12);
+                cursor: pointer; font-size: 13px; color: #6b6e7a; line-height: 1;
             }
-            .sn-checkbox-wrap input:checked + .sn-checkbox-box { background: #4caf50; border-color: #4caf50; }
-            .sn-checkbox-wrap input:checked + .sn-checkbox-box::after {
-                content: ''; position: absolute; left: 4px; top: 1px; width: 3px; height: 7px;
-                border: solid #14151c; border-width: 0 2px 2px 0; transform: rotate(45deg);
-            }
-            .sn-sub-row { display: flex; align-items: center; gap: 8px; padding: 4px 0 4px 22px; }
+            .sn-icon-btn.active { background: #1f3d24; border-color: #4caf50; color: #e8e9ee; }
+            .sn-icon-btn:hover { border-color: rgba(255,255,255,0.3); }
+            #sn-toggle-advanced { margin-left: auto; }
+
+            /* Advanced section - hidden until the gear icon is clicked. */
+            #sn-advanced { display: none; margin-top: 10px; }
+            #sn-advanced.open { display: block; }
+            .sn-section { padding: 8px 0; border-top: 1px solid rgba(255,255,255,0.07); }
+            .sn-section:first-child { border-top: none; padding-top: 0; }
+            .sn-sub-row { display: flex; align-items: center; gap: 8px; }
             .sn-sub-row input[type="range"] { flex: 1; accent-color: #4caf50; }
             #sn-volume-label { width: 30px; text-align: right; font-size: 10px; color: #8a8d99; }
             .sn-field { width: 100%; margin-top: 6px; font-size: 11px; padding: 6px 8px;
                 background: #1e2029; border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; color: #e8e9ee; }
             .sn-field::placeholder { color: #6b6e7a; }
-            .sn-fields-wrap { padding-left: 22px; }
             .sn-btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
             .sn-btn {
                 font-size: 11px; padding: 6px 4px; cursor: pointer; border-radius: 6px;
@@ -632,34 +642,38 @@
                 <div id="sn-toggle-arrow">▾</div>
             </div>
             <div id="sn-body">
-                <div class="sn-section">
-                    <label class="sn-row"><span class="sn-checkbox-wrap"><input type="checkbox" id="sn-master"><span class="sn-checkbox-box"></span></span> Enabled</label>
-                    <label class="sn-row"><span class="sn-checkbox-wrap"><input type="checkbox" id="sn-sound"><span class="sn-checkbox-box"></span></span> Sound</label>
-                    <div class="sn-sub-row">
-                        <span>🔊</span>
-                        <input type="range" id="sn-volume" min="0" max="100" step="1">
-                        <span id="sn-volume-label"></span>
-                    </div>
-                    <label class="sn-row"><span class="sn-checkbox-wrap"><input type="checkbox" id="sn-notif"><span class="sn-checkbox-box"></span></span> Windows popups</label>
+                <div id="sn-toggle-row">
+                    <button id="sn-toggle-master" class="sn-icon-btn" title="Enabled">🔔</button>
+                    <button id="sn-toggle-sound" class="sn-icon-btn" title="Sound">🔊</button>
+                    <button id="sn-toggle-popup" class="sn-icon-btn" title="Windows popups">🖥</button>
+                    <button id="sn-toggle-telegram" class="sn-icon-btn" title="Phone push (Telegram)">📱</button>
+                    <button id="sn-toggle-advanced" class="sn-icon-btn" title="More settings">⚙</button>
                 </div>
 
-                <div class="sn-section">
-                    <label class="sn-row"><span class="sn-checkbox-wrap"><input type="checkbox" id="sn-telegram"><span class="sn-checkbox-box"></span></span> Phone push (Telegram)</label>
-                    <div id="sn-telegram-fields" class="sn-fields-wrap" style="display:none;">
-                        <input id="sn-tg-token" class="sn-field" type="password" placeholder="Bot token">
-                        <input id="sn-tg-chatid" class="sn-field" type="text" placeholder="Chat ID">
+                <div id="sn-advanced">
+                    <div class="sn-section">
+                        <div class="sn-sub-row">
+                            <span>🔊</span>
+                            <input type="range" id="sn-volume" min="0" max="100" step="1">
+                            <span id="sn-volume-label"></span>
+                        </div>
                     </div>
-                </div>
 
-                <div class="sn-section">
-                    <button id="sn-enable-notif" class="sn-btn sn-btn-full" style="margin-bottom:6px;">Grant notification permission</button>
-                    <div class="sn-btn-grid">
-                        <button id="sn-test-sound" class="sn-btn">Test sound</button>
-                        <button id="sn-test-popup" class="sn-btn">Test popup</button>
-                        <button id="sn-test-telegram" class="sn-btn sn-btn-full">Test phone push</button>
-                        <button id="sn-debug-scan" class="sn-btn sn-btn-full">Debug scan (check console)</button>
+                    <div class="sn-section">
+                        <input id="sn-tg-token" class="sn-field" type="password" placeholder="Telegram bot token">
+                        <input id="sn-tg-chatid" class="sn-field" type="text" placeholder="Telegram chat ID">
                     </div>
-                    <div id="sn-status"></div>
+
+                    <div class="sn-section">
+                        <button id="sn-enable-notif" class="sn-btn sn-btn-full" style="margin-bottom:6px;">Grant notification permission</button>
+                        <div class="sn-btn-grid">
+                            <button id="sn-test-sound" class="sn-btn">Test sound</button>
+                            <button id="sn-test-popup" class="sn-btn">Test popup</button>
+                            <button id="sn-test-telegram" class="sn-btn sn-btn-full">Test phone push</button>
+                            <button id="sn-debug-scan" class="sn-btn sn-btn-full">Debug scan (check console)</button>
+                        </div>
+                        <div id="sn-status"></div>
+                    </div>
                 </div>
             </div>
         `;
@@ -676,13 +690,14 @@
         const toggleArrow = panel.querySelector('#sn-toggle-arrow');
         const body = panel.querySelector('#sn-body');
         const dot = panel.querySelector('#sn-dot');
-        const masterCb = panel.querySelector('#sn-master');
-        const soundCb = panel.querySelector('#sn-sound');
+        const masterBtn = panel.querySelector('#sn-toggle-master');
+        const soundBtn = panel.querySelector('#sn-toggle-sound');
+        const popupBtn = panel.querySelector('#sn-toggle-popup');
+        const telegramBtn = panel.querySelector('#sn-toggle-telegram');
+        const advancedBtn = panel.querySelector('#sn-toggle-advanced');
+        const advancedPanel = panel.querySelector('#sn-advanced');
         const volumeSlider = panel.querySelector('#sn-volume');
         const volumeLabel = panel.querySelector('#sn-volume-label');
-        const notifCb = panel.querySelector('#sn-notif');
-        const telegramCb = panel.querySelector('#sn-telegram');
-        const telegramFields = panel.querySelector('#sn-telegram-fields');
         const tokenInput = panel.querySelector('#sn-tg-token');
         const chatIdInput = panel.querySelector('#sn-tg-chatid');
         const status = panel.querySelector('#sn-status');
@@ -743,15 +758,19 @@
             }
         });
 
-        masterCb.checked = settings.masterEnabled;
-        soundCb.checked = settings.soundEnabled;
+        function setActive(btn, active) {
+            btn.classList.toggle('active', active);
+        }
+
+        setActive(masterBtn, settings.masterEnabled);
+        setActive(soundBtn, settings.soundEnabled);
+        setActive(popupBtn, settings.notifEnabled);
+        setActive(telegramBtn, settings.telegramEnabled);
+
         volumeSlider.value = Math.round((settings.volume ?? 0.8) * 100);
         volumeLabel.textContent = `${volumeSlider.value}%`;
-        notifCb.checked = settings.notifEnabled;
-        telegramCb.checked = settings.telegramEnabled;
         tokenInput.value = settings.telegramBotToken;
         chatIdInput.value = settings.telegramChatId;
-        telegramFields.style.display = settings.telegramEnabled ? 'block' : 'none';
 
         function refreshStatus() {
             const perm = ('Notification' in window) ? Notification.permission : 'unsupported';
@@ -764,17 +783,36 @@
         }
         updateDot();
 
-        masterCb.addEventListener('change', () => { settings.masterEnabled = masterCb.checked; saveSettings(settings); updateDot(); });
-        soundCb.addEventListener('change', () => { settings.soundEnabled = soundCb.checked; saveSettings(settings); });
+        masterBtn.addEventListener('click', () => {
+            settings.masterEnabled = !settings.masterEnabled;
+            saveSettings(settings);
+            setActive(masterBtn, settings.masterEnabled);
+            updateDot();
+        });
+        soundBtn.addEventListener('click', () => {
+            settings.soundEnabled = !settings.soundEnabled;
+            saveSettings(settings);
+            setActive(soundBtn, settings.soundEnabled);
+        });
+        popupBtn.addEventListener('click', () => {
+            settings.notifEnabled = !settings.notifEnabled;
+            saveSettings(settings);
+            setActive(popupBtn, settings.notifEnabled);
+        });
+        telegramBtn.addEventListener('click', () => {
+            settings.telegramEnabled = !settings.telegramEnabled;
+            saveSettings(settings);
+            setActive(telegramBtn, settings.telegramEnabled);
+        });
+        advancedBtn.addEventListener('click', () => {
+            const open = !advancedPanel.classList.contains('open');
+            advancedPanel.classList.toggle('open', open);
+            setActive(advancedBtn, open);
+        });
+
         volumeSlider.addEventListener('input', () => {
             settings.volume = Number(volumeSlider.value) / 100;
             volumeLabel.textContent = `${volumeSlider.value}%`;
-            saveSettings(settings);
-        });
-        notifCb.addEventListener('change', () => { settings.notifEnabled = notifCb.checked; saveSettings(settings); });
-        telegramCb.addEventListener('change', () => {
-            settings.telegramEnabled = telegramCb.checked;
-            telegramFields.style.display = settings.telegramEnabled ? 'block' : 'none';
             saveSettings(settings);
         });
         tokenInput.addEventListener('change', () => { settings.telegramBotToken = tokenInput.value.trim(); saveSettings(settings); });
@@ -809,7 +847,7 @@
             settings.telegramBotToken = tokenInput.value.trim();
             settings.telegramChatId = chatIdInput.value.trim();
             settings.telegramEnabled = true;
-            telegramCb.checked = true;
+            setActive(telegramBtn, true);
             saveSettings(settings);
 
             status.textContent = 'Sending test message...';
@@ -860,7 +898,7 @@
 
     function init(mode) {
         currentMode = mode;
-        console.log(`Stake Notifier: active (v4.4, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
+        console.log(`Stake Notifier: active (v4.5, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
         logIframeAccess();
 
         // Both the lobby page and the game iframe run this script, but the
