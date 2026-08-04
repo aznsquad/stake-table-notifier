@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      4.6
+// @version      4.7
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -234,18 +234,6 @@
     // page, never inside an actual game frame - see runChecks below)
     // ---------------------------------------------------------------
     const seenTables = new Set();
-    const KEYWORDS = ['baccarat', 'speed', 'dragon', 'tiger', 'sic bo', 'andar', 'teen patti', 'roulette', 'blackjack', 'mega'];
-
-    function getCardSignature(el) {
-        const title = el.textContent?.match(/[A-Za-z][A-Za-z\s]+/)?.[0]?.trim() || '';
-        const rate = el.textContent?.match(/\$[\d.]+/)?.[0] || '';
-        return (title + rate).slice(0, 80);
-    }
-
-    function looksLikeTargetGame(text) {
-        const lower = text.toLowerCase();
-        return KEYWORDS.some(k => lower.includes(k));
-    }
 
     // Evolution and Pragmatic use the same underlying idea (surface
     // tables matching a favourable pattern) but expose it completely
@@ -273,35 +261,41 @@
         return colorOf(patternEl) !== colorOf(neutralEl);
     }
 
+    // Was previously matched via document.querySelectorAll('[class*="card"],
+    // [class*="table"], .game-card, [role="button"]') + a keyword check -
+    // that relied on Evolution's card markup using class names containing
+    // "card"/"table", which it apparently doesn't (that's very likely why
+    // sound/popup/Telegram all worked on Pragmatic but never fired on
+    // Evolution - not just sound alone, since all three are gated behind
+    // the same "found > 0" check below). Switched to the same
+    // findVisibleTableNames() text-matching approach already proven to
+    // work for Pragmatic's in-game Good Roads tab, which doesn't depend on
+    // any class names at all.
     function checkForNewTables(seedOnly) {
         // Only alert for tables surfaced by the Good/Hot Roads filter,
         // not every table on the lobby page. If we can't tell (null),
         // proceed anyway rather than going silently dead.
         if (isPatternFilterActive() === false) return;
 
-        const cards = document.querySelectorAll('[class*="card"], [class*="table"], .game-card, [role="button"]');
+        const namesNow = findVisibleTableNames();
         let found = 0;
 
-        cards.forEach(card => {
-            if (!card.textContent || !looksLikeTargetGame(card.textContent)) return;
-
-            const sig = getCardSignature(card);
-            if (sig && !seenTables.has(sig)) {
-                seenTables.add(sig);
-                if (seedOnly) return; // baseline snapshot on page load - don't alert on what was already there
-
-                found++;
-                const originalBg = card.style.backgroundColor;
-                card.style.backgroundColor = 'rgba(76, 175, 80, 0.3)';
-                setTimeout(() => { card.style.backgroundColor = originalBg; }, 1000);
+        namesNow.forEach(name => {
+            if (!seenTables.has(name)) {
+                seenTables.add(name);
+                if (!seedOnly) found++;
             }
         });
 
+        for (const name of seenTables) {
+            if (!namesNow.has(name)) seenTables.delete(name);
+        }
+
         if (found > 0) {
             playSound('newTable');
-            showPopup('New table available', `${found} new table(s) just showed up in the multiview.`);
+            showPopup('New table available', `${found} new table(s) just showed up matching your Good/Hot Roads pattern.`);
             sendTelegram(`${found} new table(s) just showed up matching your Good/Hot Roads pattern.`);
-            console.log(`Stake Notifier: ${found} new table(s) detected`);
+            console.log(`Stake Notifier: ${found} new table(s) detected`, [...namesNow]);
         }
     }
 
@@ -903,7 +897,7 @@
 
     function init(mode) {
         currentMode = mode;
-        console.log(`Stake Notifier: active (v4.6, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
+        console.log(`Stake Notifier: active (v4.7, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
         logIframeAccess();
 
         // Both the lobby page and the game iframe run this script, but the
