@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      4.8
+// @version      4.9
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -96,6 +96,25 @@
             audioContext.resume();
         }
         return audioContext;
+    }
+
+    // Browsers block audio from playing until the page has had a genuine
+    // user interaction (autoplay policy). Since alerts fire on their own
+    // (not from a click), the very first automatic sound can silently do
+    // nothing even though nothing errors - "Test sound" only ever worked
+    // because clicking that button IS the required interaction. Unlock the
+    // context as early as possible on the first real interaction anywhere
+    // on the page, so by the time a genuine alert needs to fire, it can.
+    function unlockAudioOnFirstInteraction() {
+        const unlock = () => {
+            getAudioContext();
+            document.removeEventListener('click', unlock, true);
+            document.removeEventListener('keydown', unlock, true);
+            document.removeEventListener('touchstart', unlock, true);
+        };
+        document.addEventListener('click', unlock, true);
+        document.addEventListener('keydown', unlock, true);
+        document.addEventListener('touchstart', unlock, true);
     }
 
     // toneType: 'newTable' | 'betOpen' | 'test'
@@ -920,8 +939,9 @@
 
     function init(mode) {
         currentMode = mode;
-        console.log(`Stake Notifier: active (v4.8, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
+        console.log(`Stake Notifier: active (v4.9, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
         logIframeAccess();
+        unlockAudioOnFirstInteraction();
 
         // Both the lobby page and the game iframe run this script, but the
         // panel only ever shows on the lobby/main window - never inside the
