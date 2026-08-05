@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      4.7
+// @version      4.8
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -235,6 +235,35 @@
     // ---------------------------------------------------------------
     const seenTables = new Set();
 
+    // Collapses all whitespace (including non-breaking spaces, which \s
+    // matches in JS regex) down to single regular spaces and trims. Button
+    // labels rendered as icon+text can end up with a literal NBSP or other
+    // odd whitespace between words that a plain string comparison misses.
+    function normalizeText(t) {
+        return (t || '').replace(/\s+/g, ' ').trim();
+    }
+
+    // Finds the smallest/most specific element (by normalized text length)
+    // whose text matches the given pattern, among a length ceiling. This
+    // deliberately does NOT require the element to have zero children -
+    // requiring that (an exact "leaf" match) is what broke Hot Roads
+    // detection on Evolution: its label sits in its own span alongside an
+    // icon span, so no single zero-children leaf ever held exactly "Hot
+    // Roads" on its own. Searching all elements and taking the shortest
+    // match converges on the most specific one regardless of how the icon
+    // and label are split across child nodes.
+    function findShortestTextMatch(pattern, maxLen) {
+        const all = Array.from(document.querySelectorAll('button, div, span, a, label'));
+        let best = null;
+        let bestLen = Infinity;
+        all.forEach(el => {
+            const t = normalizeText(el.textContent);
+            if (!t || t.length > maxLen || !pattern.test(t)) return;
+            if (t.length < bestLen) { bestLen = t.length; best = el; }
+        });
+        return best;
+    }
+
     // Evolution and Pragmatic use the same underlying idea (surface
     // tables matching a favourable pattern) but expose it completely
     // differently:
@@ -248,10 +277,8 @@
     // "Speed") to tell whether it's the one currently active. Returns
     // null if we can't find enough of the filter row to tell.
     function isPatternFilterActive() {
-        const leafEls = Array.from(document.querySelectorAll('button, div, span'))
-            .filter(el => el.children.length === 0);
-        const patternEl = leafEls.find(el => /^(good roads|hot roads)$/i.test((el.textContent || '').trim()));
-        const neutralEl = leafEls.find(el => /^speed$/i.test((el.textContent || '').trim()));
+        const patternEl = findShortestTextMatch(/hot\s*roads|good\s*roads/i, 24);
+        const neutralEl = findShortestTextMatch(/^speed$/i, 12);
         if (!patternEl || !neutralEl) return null;
 
         function colorOf(el) {
@@ -320,10 +347,8 @@
     // tell (e.g. markup changed), in which case we proceed anyway rather
     // than going silently dead.
     function isGoodRoadsTabActive() {
-        const leafEls = Array.from(document.querySelectorAll('button, div, span'))
-            .filter(el => el.children.length === 0);
-        const allTablesEl = leafEls.find(el => /^all tables$/i.test((el.textContent || '').trim()));
-        const goodRoadsEl = leafEls.find(el => /^good roads$/i.test((el.textContent || '').trim()));
+        const allTablesEl = findShortestTextMatch(/all\s*tables/i, 24);
+        const goodRoadsEl = findShortestTextMatch(/good\s*roads/i, 24);
         if (!allTablesEl || !goodRoadsEl) return null;
 
         function luminance(el) {
@@ -546,11 +571,9 @@
         const tableNames = [...findVisibleTableNames()];
         const openBetTables = [...findActiveBetTables()];
 
-        const leafEls = Array.from(document.querySelectorAll('button, div, span'))
-            .filter(el => el.children.length === 0);
-        const hasAllTablesLabel = leafEls.some(el => /^all tables$/i.test((el.textContent || '').trim()));
-        const hasGoodRoadsLabel = leafEls.some(el => /^good roads$/i.test((el.textContent || '').trim()));
-        const hasHotRoadsLabel = leafEls.some(el => /^hot roads$/i.test((el.textContent || '').trim()));
+        const hasAllTablesLabel = !!findShortestTextMatch(/all\s*tables/i, 24);
+        const hasGoodRoadsLabel = !!findShortestTextMatch(/good\s*roads/i, 24);
+        const hasHotRoadsLabel = !!findShortestTextMatch(/hot\s*roads/i, 24);
         const patternFilterActive = isPatternFilterActive();
 
         // Logged as a JSON string, not a raw object - some console
@@ -897,7 +920,7 @@
 
     function init(mode) {
         currentMode = mode;
-        console.log(`Stake Notifier: active (v4.7, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
+        console.log(`Stake Notifier: active (v4.8, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
         logIframeAccess();
 
         // Both the lobby page and the game iframe run this script, but the
