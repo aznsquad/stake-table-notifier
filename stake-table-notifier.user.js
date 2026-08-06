@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      5.2
+// @version      6.0
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -64,7 +64,7 @@
     // guess again. Tampermonkey caches @require content aggressively, and
     // several rounds of debugging were wasted testing stale code that
     // looked identical from the outside. Keep this in sync with @version.
-    const SCRIPT_VERSION = '5.2';
+    const SCRIPT_VERSION = '6.0';
 
     const CHECK_INTERVAL_MS = 500;
     const ESCALATION_DELAY_MS = 8000;      // how long a bet window must stay open + you stay away before we buzz your phone
@@ -102,6 +102,99 @@
     }
 
     // ---------------------------------------------------------------
+    // FRAME BRIDGE
+    //
+    // Detection has to happen INSIDE the provider's game iframe (that's
+    // where the tiles, Good/Hot Roads panel and bet spots live), but
+    // alerting must NOT happen there:
+    //
+    //  - Audio: a cross-origin iframe has its own AudioContext and its own
+    //    autoplay-unlock requirement. The user clicks around on stake.com,
+    //    not inside Evolution's canvas, so that frame's audio stayed
+    //    permanently blocked - which is exactly why Pragmatic made sound
+    //    and Evolution never did. Previously "solved" by drawing a
+    //    click-to-unlock badge in the game frame, which is the second box
+    //    on screen the user has repeatedly asked to get rid of.
+    //  - Popups/Telegram: firing from both frames means duplicates, and
+    //    the game frame's own visibility/focus state is not a reliable
+    //    stand-in for "is the user looking at this".
+    //
+    // So: game frame detects and posts events up; the top frame owns the
+    // panel, the AudioContext (unlocked by ordinary clicking on stake.com),
+    // notifications and Telegram. One box, one alert, working sound on
+    // both providers.
+    // ---------------------------------------------------------------
+    const IS_TOP = (function () {
+        try { return window.top === window; } catch (e) { return false; }
+    })();
+
+    const BRIDGE_MARKER = 'stake-notifier-event';
+
+    function dispatchEvent_(evt) {
+        if (IS_TOP) { handleAlertEvent(evt); return; }
+        try {
+            window.top.postMessage({ __marker: BRIDGE_MARKER, version: SCRIPT_VERSION, evt }, '*');
+        } catch (e) { /* top frame unreachable - nothing we can do */ }
+    }
+
+    function handleAlertEvent(evt) {
+        if (!settings.masterEnabled) return;
+
+        if (evt.type === 'new-tables') {
+            playSound('newTable');
+            showPopup('Good Roads table found', evt.body);
+            sendTelegram(evt.body);
+            console.log('Stake Notifier: ALERT new tables -', evt.body);
+        } else if (evt.type === 'bet-open') {
+            playSound('betOpen');
+            showPopup('Bet window open', `${evt.key || 'A table'} is accepting bets right now.`);
+            startFlashing();
+            console.log('Stake Notifier: ALERT bet window open -', evt.key);
+            // Only buzz the phone if they still haven't come back by then.
+            setTimeout(() => {
+                if (!isUserAway()) return;
+                sendTelegram(`Bet window open on Stake (${evt.key}) and you have not acted - go check.`);
+            }, ESCALATION_DELAY_MS);
+        } else if (evt.type === 'all-bets-closed') {
+            stopFlashing();
+        }
+    }
+
+    // Debug snapshots from the game frame land here so the (cross-origin)
+    // frame's real markup can be inspected from the top frame instead of
+    // guessed at. Read with:  window.__SN_DEBUG__
+    function receiveDebugSnapshot(snap) {
+        try {
+            if (!window.__SN_DEBUG__) window.__SN_DEBUG__ = {};
+            window.__SN_DEBUG__[snap.host] = snap;
+        } catch (e) { /* sandboxed window - DOM mirror below covers it */ }
+
+        // Tampermonkey runs granted scripts in a sandbox, so the window
+        // property above may be invisible to page-context devtools. Mirror
+        // it into the DOM, which is always reachable.
+        let node = document.getElementById('sn-debug-data');
+        if (!node) {
+            node = document.createElement('script');
+            node.type = 'application/json';
+            node.id = 'sn-debug-data';
+            document.documentElement.appendChild(node);
+        }
+        let store = {};
+        try { store = JSON.parse(node.textContent || '{}'); } catch (e) { store = {}; }
+        store[snap.host] = snap;
+        node.textContent = JSON.stringify(store);
+    }
+
+    function listenForFrameEvents() {
+        window.addEventListener('message', (e) => {
+            const d = e.data;
+            if (!d || d.__marker !== BRIDGE_MARKER) return;
+            if (d.debug) { receiveDebugSnapshot(d.debug); return; }
+            if (d.evt) handleAlertEvent(d.evt);
+        });
+    }
+
+    // ---------------------------------------------------------------
     // AUDIO
     // ---------------------------------------------------------------
     let audioContext = null;
@@ -133,40 +226,6 @@
         document.addEventListener('click', unlock, true);
         document.addEventListener('keydown', unlock, true);
         document.addEventListener('touchstart', unlock, true);
-    }
-
-    // The lobby panel (with "Test sound") lives on a DIFFERENT browser
-    // frame than the live game - a click there does NOT unlock audio for
-    // the game iframe's own AudioContext, since cross-origin frames each
-    // need their own user gesture. Without this, bet-open/Good Roads sound
-    // alerts sourced from inside the game frame stay silently blocked
-    // forever if the user never happens to click inside that frame.
-    // This badge is a small, clearly-separate, deliberately-placed button
-    // (top-left, nowhere near any bet control) whose only purpose is to be
-    // a safe one-click way to unlock that frame's audio.
-    function buildSoundUnlockBadge() {
-        const badge = document.createElement('button');
-        badge.id = 'stake-notifier-sound-unlock';
-        // Version shown here too: this badge only ever renders inside the
-        // provider's game frame, so seeing it is itself proof the script
-        // activated in the frame that actually matters.
-        badge.textContent = `🔈 Click to enable sound alerts (v${SCRIPT_VERSION})`;
-        badge.style.cssText = `
-            position: fixed; top: 8px; left: 8px; z-index: 999999;
-            background: #14151c; color: #e8e9ee; border: 1px solid rgba(255,255,255,0.25);
-            border-radius: 6px; padding: 6px 10px; font: 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.4);
-        `;
-        document.body.appendChild(badge);
-
-        badge.addEventListener('click', (e) => {
-            e.stopPropagation();
-            getAudioContext();
-            playSound('test'); // audible confirmation it actually unlocked
-            badge.remove();
-        });
-
-        return badge;
     }
 
     // toneType: 'newTable' | 'betOpen' | 'test'
@@ -410,6 +469,7 @@
     // ---------------------------------------------------------------
     const betOpenTables = new Map(); // key (table name) -> { escalated }
     let betOpenConsecutiveHits = new Map(); // key -> consecutive-hit counter
+    let hadOpenTables = false;              // so "all closed" is sent once, not every poll
     const BET_HITS_TO_CONFIRM = 2; // require 2 consecutive polls agreeing before firing, to kill one-frame flicker false positives
 
     // Only true when the "Good Roads" tab is the one currently selected
@@ -469,14 +529,6 @@
         return keys;
     }
 
-    function escalateToPhone(key) {
-        const state = betOpenTables.get(key);
-        if (!state || state.escalated) return;
-        if (!isUserAway()) return; // they came back on their own, no need to buzz the phone
-        state.escalated = true;
-        sendTelegram(`Bet window open on Stake (${key}) and you have not acted - go check.`);
-    }
-
     // ---------------------------------------------------------------
     // GAME FRAME: "new Good Roads table appeared" detection. This is
     // the original ask - a sound when a table shows up matching your
@@ -523,9 +575,11 @@
         }
 
         if (found > 0) {
-            playSound('newTable');
-            showPopup('Good Roads table found', `${found} table(s) now match your preferred pattern.`);
-            sendTelegram(`${found} table(s) now match your Good Roads pattern - go check.`);
+            dispatchEvent_({
+                type: 'new-tables',
+                count: found,
+                body: `${found} table(s) now match your Good Roads pattern - go check.`
+            });
             console.log('Stake Notifier: new Good Roads table(s) detected', [...namesNow]);
         }
     }
@@ -564,11 +618,8 @@
         confirmedOpenKeys.forEach(key => {
             if (!betOpenTables.has(key)) {
                 betOpenTables.set(key, { escalated: false });
-                playSound('betOpen');
-                showPopup('Bet window open', `${key || 'A table'} is accepting bets right now.`);
-                startFlashing();
                 console.log('Stake Notifier: bet window opened for', key);
-                setTimeout(() => escalateToPhone(key), ESCALATION_DELAY_MS);
+                dispatchEvent_({ type: 'bet-open', key });
             }
         });
 
@@ -576,7 +627,12 @@
             if (!confirmedOpenKeys.has(key)) betOpenTables.delete(key);
         }
 
-        if (betOpenTables.size === 0) stopFlashing();
+        // Only on the transition to zero - otherwise this would post a
+        // message up to the top frame twice a second, forever.
+        if (betOpenTables.size === 0 && hadOpenTables) {
+            dispatchEvent_({ type: 'all-bets-closed' });
+        }
+        hadOpenTables = betOpenTables.size > 0;
     }
 
     let firstRunDone = false;
@@ -604,6 +660,7 @@
         if (currentMode === 'game-frame') {
             checkForNewGoodRoadsTables(seedOnly);
             checkForOpenBets(seedOnly);
+            maybeSendDebugSnapshot();
         }
         firstRunDone = true;
     }
@@ -669,6 +726,45 @@
             tableNamesVisible: tableNames,
             tablesShowingBetButtons: openBetTables
         }, null, 2));
+    }
+
+    // Periodic digest of what the game frame can actually see, posted up
+    // to the top frame and readable there via window.__SN_DEBUG__ or the
+    // #sn-debug-data node. The game frame is cross-origin, so this is the
+    // only way to inspect its real markup instead of guessing at it - and
+    // guessing at it is precisely how Evolution stayed broken for days.
+    let lastDebugSnapshotAt = 0;
+    function maybeSendDebugSnapshot() {
+        const now = Date.now();
+        if (now - lastDebugSnapshotAt < 3000) return;
+        lastDebugSnapshotAt = now;
+
+        const leaves = Array.from(document.querySelectorAll('div, span, button, p, h1, h2, h3, h4'))
+            .filter(el => el.children.length === 0);
+        const leafTexts = {};
+        leaves.forEach(el => {
+            const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (!t || t.length > 24) return;
+            leafTexts[t] = (leafTexts[t] || 0) + 1;
+        });
+
+        const snap = {
+            host: location.hostname,
+            provider: detectProvider(),
+            mode: currentMode,
+            goodRoadsTabActive: isGoodRoadsTabActive(),
+            patternFilterActive: isPatternFilterActive(),
+            tableNames: [...findVisibleTableNames()],
+            betTables: [...findActiveBetTables()],
+            canvasCount: document.querySelectorAll('canvas').length,
+            leafTexts,
+            bodyTextSample: (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 3000)
+        };
+
+        if (IS_TOP) { receiveDebugSnapshot(snap); return; }
+        try {
+            window.top.postMessage({ __marker: BRIDGE_MARKER, debug: snap }, '*');
+        } catch (e) { /* nothing to do */ }
     }
 
     // ---------------------------------------------------------------
@@ -1030,15 +1126,14 @@
         if (mode === 'lobby') {
             buildPanel();
             unlockAudioOnFirstInteraction();
-        } else if (mode === 'game-frame') {
-            // The lobby panel's clicks don't unlock THIS frame's audio -
-            // it's a separate (often cross-origin) browser context. Show a
-            // small, safe, dedicated button until it's clicked, and also
-            // still listen for any other interaction in case the user
-            // happens to click elsewhere in the game frame first.
-            const badge = buildSoundUnlockBadge();
-            unlockAudioOnFirstInteraction(() => badge.remove());
+            listenForFrameEvents();
         }
+        // game-frame mode deliberately builds NO UI at all - not a panel,
+        // not a sound-unlock badge. It detects and posts events up to the
+        // top frame, which owns every user-visible thing. That is what
+        // keeps exactly one box on screen, and what makes Evolution audible
+        // (the top frame's audio is already unlocked by normal clicking on
+        // stake.com, whereas the game frame's never was).
 
         setInterval(runChecks, CHECK_INTERVAL_MS);
 
