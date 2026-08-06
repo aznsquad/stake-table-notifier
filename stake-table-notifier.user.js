@@ -8,7 +8,17 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @run-at       document-end
+// @updateURL    https://raw.githubusercontent.com/aznsquad/stake-table-notifier/main/stake-table-notifier.user.js
+// @downloadURL  https://raw.githubusercontent.com/aznsquad/stake-table-notifier/main/stake-table-notifier.user.js
 // ==/UserScript==
+
+// INSTALL THIS FILE DIRECTLY AS A USERSCRIPT - do NOT wrap it in a second
+// script that pulls this one in via @require. Tampermonkey caches @require
+// payloads aggressively and does NOT re-fetch them just because the outer
+// wrapper was saved, which silently pins you to old code that looks
+// identical from the outside. With @updateURL/@downloadURL set above and
+// the version bumped on each change, Tampermonkey's normal auto-update
+// path handles this correctly instead.
 
 // NOTE on @match *://*/*: the actual live-casino game client (Big Road,
 // Good Roads tab, bet button) loads inside a separate iframe served from
