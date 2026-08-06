@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      5.1
+// @version      5.2
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -49,6 +49,13 @@
     // there's no UI to change them and a value saved under an old default
     // would otherwise silently stick around forever even after the default
     // itself is tightened later.
+    // Single source of truth for the version, shown in the panel header and
+    // in every log line - so "which version is actually loaded?" is never a
+    // guess again. Tampermonkey caches @require content aggressively, and
+    // several rounds of debugging were wasted testing stale code that
+    // looked identical from the outside. Keep this in sync with @version.
+    const SCRIPT_VERSION = '5.2';
+
     const CHECK_INTERVAL_MS = 500;
     const ESCALATION_DELAY_MS = 8000;      // how long a bet window must stay open + you stay away before we buzz your phone
     const TELEGRAM_MIN_INTERVAL_MS = 60000; // don't phone-ping more than once per minute, even if multiple windows escalate
@@ -130,7 +137,10 @@
     function buildSoundUnlockBadge() {
         const badge = document.createElement('button');
         badge.id = 'stake-notifier-sound-unlock';
-        badge.textContent = '🔈 Click to enable sound alerts';
+        // Version shown here too: this badge only ever renders inside the
+        // provider's game frame, so seeing it is itself proof the script
+        // activated in the frame that actually matters.
+        badge.textContent = `🔈 Click to enable sound alerts (v${SCRIPT_VERSION})`;
         badge.style.cssText = `
             position: fixed; top: 8px; left: 8px; z-index: 999999;
             background: #14151c; color: #e8e9ee; border: 1px solid rgba(255,255,255,0.25);
@@ -674,6 +684,7 @@
             #sn-header:active { cursor: grabbing; }
             #sn-dot { width: 7px; height: 7px; border-radius: 50%; background: #4caf50; flex-shrink: 0; }
             #sn-title { font-weight: 600; font-size: 12px; flex: 1; }
+            #sn-version { font-weight: 400; font-size: 10px; color: #8a8d99; }
             #sn-toggle-arrow { font-size: 10px; color: #8a8d99; }
             #sn-body { padding: 0 10px 10px 10px; }
 
@@ -718,7 +729,7 @@
         panel.innerHTML = `
             <div id="sn-header">
                 <div id="sn-dot"></div>
-                <div id="sn-title">Stake Notifier</div>
+                <div id="sn-title">Stake Notifier <span id="sn-version"></span></div>
                 <div id="sn-toggle-arrow">▾</div>
             </div>
             <div id="sn-body">
@@ -765,6 +776,8 @@
             panel.style.top = settings.panelPos.top + 'px';
             panel.style.bottom = 'auto';
         }
+
+        panel.querySelector('#sn-version').textContent = `v${SCRIPT_VERSION}`;
 
         const header = panel.querySelector('#sn-header');
         const toggleArrow = panel.querySelector('#sn-toggle-arrow');
@@ -995,7 +1008,7 @@
 
     function init(mode) {
         currentMode = mode;
-        console.log(`Stake Notifier: ACTIVE (v5.1, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
+        console.log(`Stake Notifier: ACTIVE (v${SCRIPT_VERSION}, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
         logIframeAccess();
 
         // Both the lobby page and the game iframe run this script, but the
@@ -1047,7 +1060,7 @@
         // always possible to tell "the userscript never got injected here"
         // apart from "it was injected but the guard rejected the frame".
         // Not having this cost days of misdiagnosis.
-        console.log(`Stake Notifier boot: frame=${location.hostname} isTop=${window.top === window}`);
+        console.log(`Stake Notifier boot v${SCRIPT_VERSION}: frame=${location.hostname} isTop=${window.top === window}`);
 
         if (isStakeLobbyPage()) {
             init('lobby');
