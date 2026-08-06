@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      6.0
+// @version      6.1
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -64,7 +64,7 @@
     // guess again. Tampermonkey caches @require content aggressively, and
     // several rounds of debugging were wasted testing stale code that
     // looked identical from the outside. Keep this in sync with @version.
-    const SCRIPT_VERSION = '6.0';
+    const SCRIPT_VERSION = '6.1';
 
     const CHECK_INTERVAL_MS = 500;
     const ESCALATION_DELAY_MS = 8000;      // how long a bet window must stay open + you stay away before we buzz your phone
@@ -130,6 +130,40 @@
 
     const BRIDGE_MARKER = 'stake-notifier-event';
 
+    // A userscript can end up installed MORE THAN ONCE - a stale entry plus
+    // a fresh install, or an "update" that lands as a second entry instead
+    // of replacing the first. Both copies then run in the same frame, and
+    // you get two panels and two of every sound. That is exactly what
+    // happened here: after updating, the top frame had two v6.0 panels.
+    //
+    // Tampermonkey sandboxes each instance, so a window-level flag is not
+    // reliably shared between them - but the DOM is. First instance to boot
+    // in a given frame plants a marker and owns that frame; any later
+    // instance goes completely inert. JS is single-threaded and each script
+    // runs as its own task, so this check-then-set cannot interleave.
+    function claimFrame() {
+        const LOCK_ID = 'sn-instance-lock';
+        if (document.getElementById(LOCK_ID)) return false;
+        const lock = document.createElement('meta');
+        lock.id = LOCK_ID;
+        lock.setAttribute('data-version', SCRIPT_VERSION);
+        (document.head || document.documentElement).appendChild(lock);
+        return true;
+    }
+
+    // Second line of defence: even if two instances somehow both go live
+    // (e.g. one in an about:blank subframe the lock can't see), don't let
+    // the same alert fire twice within a second.
+    const recentAlerts = new Map();
+    function isDuplicateAlert(evt) {
+        const key = `${evt.type}|${evt.key || evt.body || ''}`;
+        const now = Date.now();
+        const last = recentAlerts.get(key) || 0;
+        if (now - last < 1500) return true;
+        recentAlerts.set(key, now);
+        return false;
+    }
+
     function dispatchEvent_(evt) {
         if (IS_TOP) { handleAlertEvent(evt); return; }
         try {
@@ -139,6 +173,7 @@
 
     function handleAlertEvent(evt) {
         if (!settings.masterEnabled) return;
+        if (isDuplicateAlert(evt)) return;
 
         if (evt.type === 'new-tables') {
             playSound('newTable');
@@ -541,15 +576,25 @@
     // ---------------------------------------------------------------
     const seenGoodRoadsTables = new Set();
 
+    // Selector list matters more than it looks. This used to be
+    // 'div, span, h1..h4', which on Evolution matched exactly ONE table
+    // ("Elite VIP Speed Baccarat") out of the ~30 on screen - every other
+    // tile puts its name in a p/a/button/li instead. A detector that can
+    // only see 1 of 30 tables cannot possibly notice a new one appearing,
+    // which is a large part of why Evolution never alerted.
+    const NAME_LEAF_SELECTOR = 'div, span, p, a, button, li, h1, h2, h3, h4, h5, h6';
+
+    // \p{L} rather than A-Za-z: "Salon Privé Baccarat A" was silently
+    // excluded by the old ASCII-only class.
+    const TABLE_NAME_RE = /^[\p{L}][\p{L}0-9\s'&\-]{2,40}(Baccarat|Dragon Tiger)[\p{L}0-9\s'&\-]{0,10}$/iu;
+
     function findVisibleTableNames() {
-        const leafEls = Array.from(document.querySelectorAll('div, span, h1, h2, h3, h4'))
+        const leafEls = Array.from(document.querySelectorAll(NAME_LEAF_SELECTOR))
             .filter(el => el.children.length === 0);
         const names = new Set();
         leafEls.forEach(el => {
-            const t = (el.textContent || '').trim();
-            if (/^[A-Za-z][A-Za-z0-9\s]{2,40}(Baccarat|Dragon Tiger)[A-Za-z0-9\s]{0,10}$/i.test(t)) {
-                names.add(t);
-            }
+            const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (TABLE_NAME_RE.test(t)) names.add(t);
         });
         return names;
     }
@@ -690,6 +735,13 @@
     // For now this is used for logging/diagnostics so issues reported on
     // one provider can be told apart from the other.
     function detectProvider() {
+        // Hostname first - it's authoritative. Evolution's own game frame
+        // never prints the word "Evolution" anywhere in its lobby, so the
+        // text sniff below reported "unknown" for it every single time.
+        const host = location.hostname;
+        if (/evo-games\.com|evolution/i.test(host)) return 'evolution';
+        if (/pragmatic/i.test(host)) return 'pragmatic';
+
         const text = (document.body?.innerText || '').toUpperCase();
         if (/PRAGMATIC/.test(text)) return 'pragmatic';
         if (/EVOLUTION/.test(text)) return 'evolution';
@@ -748,10 +800,36 @@
             leafTexts[t] = (leafTexts[t] || 0) + 1;
         });
 
+        // The filter row is the thing that decides whether we're looking at
+        // the Hot/Good Roads view at all, so dump enough about each filter
+        // chip (classes, aria state, computed colours) to work out which one
+        // is selected without guessing.
+        const FILTER_LABELS = /^(multiplay|favourite|favorite|speed|hot\s*roads|good\s*roads|all\s*tables|salon\s*priv)/i;
+        const filters = [];
+        Array.from(document.querySelectorAll(NAME_LEAF_SELECTOR)).forEach(el => {
+            if (el.children.length !== 0) return;
+            const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (!t || t.length > 20 || !FILTER_LABELS.test(t)) return;
+            const box = el.closest('button, [role="tab"], li, a') || el;
+            const cs = getComputedStyle(box);
+            filters.push({
+                text: t,
+                tag: box.tagName,
+                cls: (box.className || '').toString().slice(0, 80),
+                ariaSelected: box.getAttribute('aria-selected'),
+                ariaCurrent: box.getAttribute('aria-current'),
+                dataActive: box.getAttribute('data-active') || box.getAttribute('data-selected'),
+                color: cs.color,
+                bg: cs.backgroundColor,
+                opacity: cs.opacity
+            });
+        });
+
         const snap = {
             host: location.hostname,
             provider: detectProvider(),
             mode: currentMode,
+            filters,
             goodRoadsTabActive: isGoodRoadsTabActive(),
             patternFilterActive: isPatternFilterActive(),
             tableNames: [...findVisibleTableNames()],
@@ -1165,7 +1243,12 @@
         // always possible to tell "the userscript never got injected here"
         // apart from "it was injected but the guard rejected the frame".
         // Not having this cost days of misdiagnosis.
-        console.log(`Stake Notifier boot v${SCRIPT_VERSION}: frame=${location.hostname} isTop=${window.top === window}`);
+        console.log(`Stake Notifier boot v${SCRIPT_VERSION}: frame=${location.hostname} isTop=${IS_TOP}`);
+
+        if (!claimFrame()) {
+            console.log(`Stake Notifier v${SCRIPT_VERSION}: another instance already owns this frame - staying inert. (You have the script installed twice in Tampermonkey; harmless now, but worth deleting the spare.)`);
+            return;
+        }
 
         if (isStakeLobbyPage()) {
             init('lobby');
