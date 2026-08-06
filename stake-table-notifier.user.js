@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      4.9
+// @version      5.0
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -105,16 +105,48 @@
     // because clicking that button IS the required interaction. Unlock the
     // context as early as possible on the first real interaction anywhere
     // on the page, so by the time a genuine alert needs to fire, it can.
-    function unlockAudioOnFirstInteraction() {
+    function unlockAudioOnFirstInteraction(onUnlock) {
         const unlock = () => {
             getAudioContext();
             document.removeEventListener('click', unlock, true);
             document.removeEventListener('keydown', unlock, true);
             document.removeEventListener('touchstart', unlock, true);
+            if (onUnlock) onUnlock();
         };
         document.addEventListener('click', unlock, true);
         document.addEventListener('keydown', unlock, true);
         document.addEventListener('touchstart', unlock, true);
+    }
+
+    // The lobby panel (with "Test sound") lives on a DIFFERENT browser
+    // frame than the live game - a click there does NOT unlock audio for
+    // the game iframe's own AudioContext, since cross-origin frames each
+    // need their own user gesture. Without this, bet-open/Good Roads sound
+    // alerts sourced from inside the game frame stay silently blocked
+    // forever if the user never happens to click inside that frame.
+    // This badge is a small, clearly-separate, deliberately-placed button
+    // (top-left, nowhere near any bet control) whose only purpose is to be
+    // a safe one-click way to unlock that frame's audio.
+    function buildSoundUnlockBadge() {
+        const badge = document.createElement('button');
+        badge.id = 'stake-notifier-sound-unlock';
+        badge.textContent = '🔈 Click to enable sound alerts';
+        badge.style.cssText = `
+            position: fixed; top: 8px; left: 8px; z-index: 999999;
+            background: #14151c; color: #e8e9ee; border: 1px solid rgba(255,255,255,0.25);
+            border-radius: 6px; padding: 6px 10px; font: 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+        `;
+        document.body.appendChild(badge);
+
+        badge.addEventListener('click', (e) => {
+            e.stopPropagation();
+            getAudioContext();
+            playSound('test'); // audible confirmation it actually unlocked
+            badge.remove();
+        });
+
+        return badge;
     }
 
     // toneType: 'newTable' | 'betOpen' | 'test'
@@ -939,9 +971,8 @@
 
     function init(mode) {
         currentMode = mode;
-        console.log(`Stake Notifier: active (v4.9, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
+        console.log(`Stake Notifier: active (v5.0, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
         logIframeAccess();
-        unlockAudioOnFirstInteraction();
 
         // Both the lobby page and the game iframe run this script, but the
         // panel only ever shows on the lobby/main window - never inside the
@@ -951,6 +982,15 @@
         // across both via GM storage, so toggles here still apply there.
         if (mode === 'lobby') {
             buildPanel();
+            unlockAudioOnFirstInteraction();
+        } else if (mode === 'game-frame') {
+            // The lobby panel's clicks don't unlock THIS frame's audio -
+            // it's a separate (often cross-origin) browser context. Show a
+            // small, safe, dedicated button until it's clicked, and also
+            // still listen for any other interaction in case the user
+            // happens to click elsewhere in the game frame first.
+            const badge = buildSoundUnlockBadge();
+            unlockAudioOnFirstInteraction(() => badge.remove());
         }
 
         setInterval(runChecks, CHECK_INTERVAL_MS);
