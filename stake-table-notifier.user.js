@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      5.0
+// @version      5.1
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -572,9 +572,16 @@
 
         if (!settings.masterEnabled) { stopFlashing(); return; }
         const seedOnly = !firstRunDone;
-        if (currentMode === 'lobby') {
-            checkForNewTables(seedOnly);
-        } else if (currentMode === 'game-frame') {
+
+        // NOTE: the outer stake.com page deliberately runs NO detection.
+        // On both providers the real tiles / Good Roads / bet buttons live
+        // inside the provider's own iframe, which this frame cannot read
+        // (cross-origin). The only baccarat-looking text reachable from
+        // out here is stake.com's own bet-history table - which is exactly
+        // what the old lobby detector was matching, firing alerts for
+        // tables that were never on screen. The outer frame's sole job is
+        // to host the settings panel.
+        if (currentMode === 'game-frame') {
             checkForNewGoodRoadsTables(seedOnly);
             checkForOpenBets(seedOnly);
         }
@@ -955,23 +962,40 @@
         }
     }
 
-    // Generic markers present on both Evolution and Pragmatic Play live
-    // baccarat tables - deliberately provider-agnostic so it doesn't need
-    // separate rules per game studio.
+    // Generic markers present on both Evolution and Pragmatic Play frames.
+    //
+    // This used to require PLAYER+BANKER (i.e. an already-open table) and
+    // was the single biggest bug in the whole script: Evolution's iframe
+    // shows a LOBBY GRID of table tiles first, with no PLAYER/BANKER text
+    // anywhere, so this returned false, the boot poller gave up after 60s,
+    // and the script stayed permanently dead in the one frame that
+    // actually contains the tiles and the Good Roads panel. Meanwhile the
+    // outer stake.com frame happily "detected" rows out of the bet-history
+    // table. Net effect on Evolution: no real alerts, plus junk ones.
+    //
+    // Now it also accepts a provider LOBBY frame: the Hot/Good Roads or
+    // All Tables filter labels, or simply several baccarat table names.
     function looksLikeLiveCasinoFrame() {
         const text = document.body?.innerText || '';
         if (!text || text.length < 20) return false;
+
         const hasPlayerBanker = /\bPLAYER\b/.test(text) && /\bBANKER\b/.test(text);
-        const hasRoadWord = /Big Road|Good Roads|Bead Road/i.test(text);
+        const hasRoadWord = /Big Road|Good Roads|Hot Roads|Bead Road/i.test(text);
         const hasBetWord = /\bBET\b/i.test(text);
-        return hasPlayerBanker || (hasRoadWord && hasBetWord);
+        const hasFilterLabels = /hot\s*roads|good\s*roads|all\s*tables/i.test(text);
+        const tableNameCount = findVisibleTableNames().size;
+
+        return hasPlayerBanker
+            || hasFilterLabels
+            || tableNameCount >= 2
+            || (hasRoadWord && hasBetWord);
     }
 
     let currentMode = null;
 
     function init(mode) {
         currentMode = mode;
-        console.log(`Stake Notifier: active (v5.0, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
+        console.log(`Stake Notifier: ACTIVE (v5.1, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
         logIframeAccess();
 
         // Both the lobby page and the game iframe run this script, but the
@@ -1019,26 +1043,30 @@
     }
 
     function bootWhenReady() {
+        // Logged unconditionally in EVERY frame, before any guard, so it's
+        // always possible to tell "the userscript never got injected here"
+        // apart from "it was injected but the guard rejected the frame".
+        // Not having this cost days of misdiagnosis.
+        console.log(`Stake Notifier boot: frame=${location.hostname} isTop=${window.top === window}`);
+
         if (isStakeLobbyPage()) {
             init('lobby');
             return;
         }
 
         // Any other frame (including the game provider's iframe, whatever
-        // its domain happens to be today): poll a few times for the table
-        // UI to render, then either activate or give up quietly for good.
-        let attempts = 0;
-        const maxAttempts = 30; // ~60s
+        // its randomized domain happens to be today). This poller used to
+        // give up permanently after ~60s, which meant a frame that only
+        // becomes recognisable later (user opens the Good Roads panel, or
+        // opens a table) was never picked up. Keep checking indefinitely -
+        // it's a cheap text test, and the frame's content genuinely does
+        // change over the life of a session.
         const detector = setInterval(() => {
-            attempts++;
             if (looksLikeLiveCasinoFrame()) {
                 clearInterval(detector);
                 init('game-frame');
-            } else if (attempts >= maxAttempts) {
-                clearInterval(detector);
-                // Not a relevant page - stays completely inert from here on.
             }
-        }, 2000);
+        }, 1500);
     }
 
     bootWhenReady();
