@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      6.1
+// @version      6.2
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -64,7 +64,7 @@
     // guess again. Tampermonkey caches @require content aggressively, and
     // several rounds of debugging were wasted testing stale code that
     // looked identical from the outside. Keep this in sync with @version.
-    const SCRIPT_VERSION = '6.1';
+    const SCRIPT_VERSION = '6.2';
 
     const CHECK_INTERVAL_MS = 500;
     const ESCALATION_DELAY_MS = 8000;      // how long a bet window must stay open + you stay away before we buzz your phone
@@ -129,6 +129,12 @@
     })();
 
     const BRIDGE_MARKER = 'stake-notifier-event';
+
+    // Unique per frame. Evolution runs several frames on the SAME hostname,
+    // so keying anything by hostname alone makes them silently overwrite
+    // each other - which is how the "30 tables, no tabs" frame and the
+    // "tabs, no tables" frame looked like one contradictory frame.
+    const FRAME_ID = `${location.hostname}#${Math.random().toString(36).slice(2, 8)}`;
 
     // A userscript can end up installed MORE THAN ONCE - a stale entry plus
     // a fresh install, or an "update" that lands as a second entry instead
@@ -216,7 +222,7 @@
         }
         let store = {};
         try { store = JSON.parse(node.textContent || '{}'); } catch (e) { store = {}; }
-        store[snap.host] = snap;
+        store[snap.frameId] = snap;
         node.textContent = JSON.stringify(store);
     }
 
@@ -225,6 +231,7 @@
             const d = e.data;
             if (!d || d.__marker !== BRIDGE_MARKER) return;
             if (d.debug) { receiveDebugSnapshot(d.debug); return; }
+            if (d.state) { receiveState(d.state); return; }
             if (d.evt) handleAlertEvent(d.evt);
         });
     }
@@ -453,44 +460,6 @@
         return colorOf(patternEl) !== colorOf(neutralEl);
     }
 
-    // Was previously matched via document.querySelectorAll('[class*="card"],
-    // [class*="table"], .game-card, [role="button"]') + a keyword check -
-    // that relied on Evolution's card markup using class names containing
-    // "card"/"table", which it apparently doesn't (that's very likely why
-    // sound/popup/Telegram all worked on Pragmatic but never fired on
-    // Evolution - not just sound alone, since all three are gated behind
-    // the same "found > 0" check below). Switched to the same
-    // findVisibleTableNames() text-matching approach already proven to
-    // work for Pragmatic's in-game Good Roads tab, which doesn't depend on
-    // any class names at all.
-    function checkForNewTables(seedOnly) {
-        // Only alert for tables surfaced by the Good/Hot Roads filter,
-        // not every table on the lobby page. If we can't tell (null),
-        // proceed anyway rather than going silently dead.
-        if (isPatternFilterActive() === false) return;
-
-        const namesNow = findVisibleTableNames();
-        let found = 0;
-
-        namesNow.forEach(name => {
-            if (!seenTables.has(name)) {
-                seenTables.add(name);
-                if (!seedOnly) found++;
-            }
-        });
-
-        for (const name of seenTables) {
-            if (!namesNow.has(name)) seenTables.delete(name);
-        }
-
-        if (found > 0) {
-            playSound('newTable');
-            showPopup('New table available', `${found} new table(s) just showed up matching your Good/Hot Roads pattern.`);
-            sendTelegram(`${found} new table(s) just showed up matching your Good/Hot Roads pattern.`);
-            console.log(`Stake Notifier: ${found} new table(s) detected`, [...namesNow]);
-        }
-    }
-
     // ---------------------------------------------------------------
     // GAME FRAME: bet-window detection (runs inside the live table
     // iframe). "Baccarat Multiplay" renders SEVERAL tables at once in a
@@ -599,88 +568,123 @@
         return names;
     }
 
-    function checkForNewGoodRoadsTables(seedOnly) {
-        const goodRoadsActive = isGoodRoadsTabActive();
-        if (goodRoadsActive === false) return; // "All Tables" active - not what this feature is for
 
-        const namesNow = findVisibleTableNames();
-        let found = 0;
+    // ---------------------------------------------------------------
+    // CROSS-FRAME AGGREGATION (top frame only)
+    //
+    // Evolution does not put everything in one frame the way Pragmatic
+    // does. Captured live from its own frames: one reports the Multiplay
+    // shell - "Big Road / ALL TABLES / GOOD ROADS / UNDO / REFRESH", chip
+    // values, and ZERO table names; another reports ~30 table names and no
+    // tabs at all. So a detector that runs per-frame and asks "is GOOD
+    // ROADS selected AND do I see new tables?" can never answer yes on
+    // Evolution: no single frame can see both halves of that question.
+    //
+    // So every frame just reports what it can see, and the top frame -
+    // which already owns the panel and the alerting - joins those reports
+    // together and makes the decision once, globally.
+    // ---------------------------------------------------------------
+    const frameStates = new Map(); // frameId -> { names, betKeys, goodRoadsActive, lastSeen }
+    const FRAME_STALE_MS = 5000;
 
-        namesNow.forEach(name => {
-            if (!seenGoodRoadsTables.has(name)) {
-                seenGoodRoadsTables.add(name);
-                if (!seedOnly) found++;
+    function receiveState(state) {
+        state.lastSeen = Date.now();
+        frameStates.set(state.frameId, state);
+    }
+
+    // A frame that can see the tab row answers true/false; frames that
+    // can't see it answer null and simply don't get a vote.
+    function isPatternViewActive() {
+        const tab = isGoodRoadsTabActive();
+        if (tab !== null) return tab;
+        return isPatternFilterActive();
+    }
+
+    function postState() {
+        const state = {
+            frameId: FRAME_ID,
+            names: [...findVisibleTableNames()],
+            betKeys: [...findActiveBetTables()],
+            goodRoadsActive: isPatternViewActive()
+        };
+        if (IS_TOP) { receiveState(state); return; }
+        try {
+            window.top.postMessage({ __marker: BRIDGE_MARKER, state }, '*');
+        } catch (e) { /* nothing to do */ }
+    }
+
+    let aggregateSeeded = false;
+
+    function aggregateAndAlert() {
+        const now = Date.now();
+        for (const [id, s] of frameStates) {
+            if (now - s.lastSeen > FRAME_STALE_MS) frameStates.delete(id);
+        }
+        const states = [...frameStates.values()];
+        if (states.length === 0) return;
+
+        // Whichever frame can actually see the tab row decides the gate.
+        let gate = null;
+        for (const s of states) {
+            if (s.goodRoadsActive === true || s.goodRoadsActive === false) {
+                gate = s.goodRoadsActive;
+                break;
             }
+        }
+
+        const namesNow = new Set();
+        const betKeysNow = new Set();
+        states.forEach(s => {
+            (s.names || []).forEach(n => namesNow.add(n));
+            (s.betKeys || []).forEach(k => betKeysNow.add(k));
         });
 
-        // A table that's no longer shown has dropped out of Good Roads -
-        // let it re-alert if it reappears later.
+        // Debounce bet detection: 2 consecutive agreeing polls, to kill
+        // one-frame flicker.
+        const nextHits = new Map();
+        betKeysNow.forEach(key => nextHits.set(key, (betOpenConsecutiveHits.get(key) || 0) + 1));
+        betOpenConsecutiveHits = nextHits;
+        const confirmedOpenKeys = new Set(
+            [...nextHits.entries()].filter(([, h]) => h >= BET_HITS_TO_CONFIRM).map(([k]) => k)
+        );
+
+        // "ALL TABLES" is explicitly selected - keep tracking state so
+        // flipping back to GOOD ROADS doesn't spuriously alert, but stay
+        // quiet. gate === null means we couldn't tell, in which case we
+        // proceed rather than going silently dead.
+        const quiet = (gate === false) || !aggregateSeeded;
+
+        namesNow.forEach(name => {
+            if (seenGoodRoadsTables.has(name)) return;
+            seenGoodRoadsTables.add(name);
+            if (quiet) return;
+            dispatchEvent_({
+                type: 'new-tables',
+                count: 1,
+                body: `${name} now matches your Good Roads pattern - go check.`
+            });
+        });
         for (const name of seenGoodRoadsTables) {
             if (!namesNow.has(name)) seenGoodRoadsTables.delete(name);
         }
 
-        if (found > 0) {
-            dispatchEvent_({
-                type: 'new-tables',
-                count: found,
-                body: `${found} table(s) now match your Good Roads pattern - go check.`
-            });
-            console.log('Stake Notifier: new Good Roads table(s) detected', [...namesNow]);
-        }
-    }
-
-    function checkForOpenBets(seedOnly) {
-        const goodRoadsActive = isGoodRoadsTabActive();
-        if (goodRoadsActive === false) {
-            // "All Tables" is definitely the active tab - alerts are
-            // scoped to Good Roads only, so stay quiet (but keep existing
-            // tracked state as-is in case the user flips tabs back).
-            return;
-        }
-
-        const openKeysNow = findActiveBetTables();
-
-        // Debounce: a table only counts as "confirmed open" after 2
-        // consecutive polls agreeing, to kill one-frame flicker.
-        const nextHits = new Map();
-        openKeysNow.forEach(key => {
-            const prev = betOpenConsecutiveHits.get(key) || 0;
-            nextHits.set(key, prev + 1);
-        });
-        betOpenConsecutiveHits = nextHits;
-
-        const confirmedOpenKeys = new Set(
-            [...nextHits.entries()].filter(([, hits]) => hits >= BET_HITS_TO_CONFIRM).map(([key]) => key)
-        );
-
-        if (seedOnly) {
-            // Baseline snapshot on page load/refresh - whatever's already
-            // open doesn't alert; only a later open transition should.
-            confirmedOpenKeys.forEach(key => betOpenTables.set(key, { escalated: false }));
-            return;
-        }
-
         confirmedOpenKeys.forEach(key => {
-            if (!betOpenTables.has(key)) {
-                betOpenTables.set(key, { escalated: false });
-                console.log('Stake Notifier: bet window opened for', key);
-                dispatchEvent_({ type: 'bet-open', key });
-            }
+            if (betOpenTables.has(key)) return;
+            betOpenTables.set(key, { escalated: false });
+            if (quiet) return;
+            console.log('Stake Notifier: bet window opened for', key);
+            dispatchEvent_({ type: 'bet-open', key });
         });
-
         for (const key of betOpenTables.keys()) {
             if (!confirmedOpenKeys.has(key)) betOpenTables.delete(key);
         }
 
-        // Only on the transition to zero - otherwise this would post a
-        // message up to the top frame twice a second, forever.
-        if (betOpenTables.size === 0 && hadOpenTables) {
-            dispatchEvent_({ type: 'all-bets-closed' });
-        }
+        if (betOpenTables.size === 0 && hadOpenTables) stopFlashing();
         hadOpenTables = betOpenTables.size > 0;
+
+        aggregateSeeded = true;
     }
 
-    let firstRunDone = false;
 
     function runChecks() {
         // The lobby and game-frame each keep their own in-memory settings
@@ -692,22 +696,24 @@
         Object.assign(settings, loadSettings());
 
         if (!settings.masterEnabled) { stopFlashing(); return; }
-        const seedOnly = !firstRunDone;
 
-        // NOTE: the outer stake.com page deliberately runs NO detection.
+        // The outer stake.com page deliberately scans NO DOM of its own.
         // On both providers the real tiles / Good Roads / bet buttons live
         // inside the provider's own iframe, which this frame cannot read
         // (cross-origin). The only baccarat-looking text reachable from
         // out here is stake.com's own bet-history table - which is exactly
         // what the old lobby detector was matching, firing alerts for
-        // tables that were never on screen. The outer frame's sole job is
-        // to host the settings panel.
+        // tables that were never on screen. Out here we only ever act on
+        // what the game frames report to us.
         if (currentMode === 'game-frame') {
-            checkForNewGoodRoadsTables(seedOnly);
-            checkForOpenBets(seedOnly);
+            // Report only. All decisions are made in the top frame, which
+            // is the only place that can see every frame's half of the
+            // picture at once.
+            postState();
             maybeSendDebugSnapshot();
+        } else if (currentMode === 'lobby') {
+            aggregateAndAlert();
         }
-        firstRunDone = true;
     }
 
     // ---------------------------------------------------------------
@@ -826,9 +832,13 @@
         });
 
         const snap = {
+            frameId: FRAME_ID,
             host: location.hostname,
+            isTop: IS_TOP,
+            childFrames: (function () { try { return window.frames.length; } catch (e) { return -1; } })(),
             provider: detectProvider(),
             mode: currentMode,
+            goodRoadsActive: isPatternViewActive(),
             filters,
             goodRoadsTabActive: isGoodRoadsTabActive(),
             patternFilterActive: isPatternFilterActive(),
