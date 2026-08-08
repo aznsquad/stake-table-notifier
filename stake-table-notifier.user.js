@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      6.2
+// @version      6.3
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -64,7 +64,7 @@
     // guess again. Tampermonkey caches @require content aggressively, and
     // several rounds of debugging were wasted testing stale code that
     // looked identical from the outside. Keep this in sync with @version.
-    const SCRIPT_VERSION = '6.2';
+    const SCRIPT_VERSION = '6.3';
 
     const CHECK_INTERVAL_MS = 500;
     const ESCALATION_DELAY_MS = 8000;      // how long a bet window must stay open + you stay away before we buzz your phone
@@ -590,6 +590,20 @@
     function receiveState(state) {
         state.lastSeen = Date.now();
         frameStates.set(state.frameId, state);
+
+        // Self-healing activation. If a game frame is reporting to us then
+        // this IS the page hosting the game, whatever its URL looks like -
+        // so stop depending on a URL pattern to decide that.
+        if (IS_TOP && currentMode === null) init('lobby');
+
+        // Aggregate right now rather than waiting for our own timer.
+        // Chrome throttles timers in hidden tabs hard - down to roughly
+        // once a minute after a few minutes backgrounded - which is
+        // precisely the case the user cares most about, being in another
+        // application. postMessage delivery is not throttled that way, so
+        // driving aggregation off the incoming message keeps alerts prompt
+        // while hidden. The interval stays on as a fallback.
+        if (IS_TOP && currentMode === 'lobby') aggregateAndAlert();
     }
 
     // A frame that can see the tab row answers true/false; frames that
@@ -1161,9 +1175,16 @@
     // to target by domain). Everywhere else it stays fully inert: no
     // audio context, no observers, no DOM scanning, nothing.
     // ---------------------------------------------------------------
+    // Deliberately loose. The old version demanded stake.com AND a
+    // /casino/games|live/ path; if either was off - a mirror domain
+    // (stake.bet, stake.us, ...), a different route, an SPA navigation -
+    // the top frame never entered lobby mode. The game frame would then
+    // post its findings up to a top frame that wasn't listening, and the
+    // whole thing went silent with no obvious symptom. Any top-level Stake
+    // page is now enough; the panel is harmless on a page with no tables.
     function isStakeLobbyPage() {
         try {
-            return location.hostname.endsWith('stake.com') && /\/casino\/(games|live)\//.test(location.pathname);
+            return IS_TOP && /(^|\.)stake\.[a-z.]+$/i.test(location.hostname);
         } catch (e) {
             return false;
         }
@@ -1214,7 +1235,6 @@
         if (mode === 'lobby') {
             buildPanel();
             unlockAudioOnFirstInteraction();
-            listenForFrameEvents();
         }
         // game-frame mode deliberately builds NO UI at all - not a panel,
         // not a sound-unlock badge. It detects and posts events up to the
@@ -1259,6 +1279,12 @@
             console.log(`Stake Notifier v${SCRIPT_VERSION}: another instance already owns this frame - staying inert. (You have the script installed twice in Tampermonkey; harmless now, but worth deleting the spare.)`);
             return;
         }
+
+        // The top frame listens BEFORE and REGARDLESS of any frame-guard
+        // decision. It is the only thing that can play a sound, so it must
+        // never be the reason an alert is lost - even if it failed to
+        // recognise itself as a Stake page.
+        if (IS_TOP) listenForFrameEvents();
 
         if (isStakeLobbyPage()) {
             init('lobby');
