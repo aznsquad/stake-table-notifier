@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      6.4
+// @version      6.5
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -64,7 +64,7 @@
     // guess again. Tampermonkey caches @require content aggressively, and
     // several rounds of debugging were wasted testing stale code that
     // looked identical from the outside. Keep this in sync with @version.
-    const SCRIPT_VERSION = '6.4';
+    const SCRIPT_VERSION = '6.5';
 
     const CHECK_INTERVAL_MS = 500;
     const ESCALATION_DELAY_MS = 8000;      // how long a bet window must stay open + you stay away before we buzz your phone
@@ -180,6 +180,7 @@
     function handleAlertEvent(evt) {
         if (!settings.masterEnabled) return;
         if (isDuplicateAlert(evt)) return;
+        lastAlertAt = Date.now();
 
         if (evt.type === 'new-tables') {
             playSound('newTable');
@@ -478,7 +479,8 @@
     const betOpenTables = new Map(); // key (table name) -> { escalated }
     let betOpenConsecutiveHits = new Map(); // key -> consecutive-hit counter
     let hadOpenTables = false;              // so "all closed" is sent once, not every poll
-    const BET_HITS_TO_CONFIRM = 2; // require 2 consecutive polls agreeing before firing, to kill one-frame flicker false positives
+    const BET_HITS_TO_CONFIRM = 2;    // distinct reports from the owning frame, not aggregation passes
+    const BET_MIN_PERSIST_MS = 1000;  // real bet windows last many seconds; a 150ms sighting is a render flicker
 
     // Only true when the "Good Roads" tab is the one currently selected
     // (vs "All Tables") - so alerts are scoped to Stake's own
@@ -495,37 +497,24 @@
         const explicit = explicitSelection(goodRoadsEl, allTablesEl);
         if (explicit !== null) return explicit;
 
-        // Luminance WEIGHTED BY ALPHA. The old version pulled r,g,b out of
-        // the computed backgroundColor and threw the alpha away, so
-        // rgba(255,255,255,0.12) - a barely-visible tint - scored a full
-        // 255 and beat a solid dark pill. It also treated the extremely
-        // common "both tabs transparent, selection shown by an underline or
-        // text colour" case as a definite FALSE rather than "can't tell":
-        // rgba(0,0,0,0) parses to four numbers, passes the length check,
-        // and yields 0 for both, so 0 > 0 === false. That single false
-        // silences the entire script - gate false means quiet, on both
-        // providers, with no diagnostic. It was structurally impossible for
-        // this function to return null once both labels were found, so the
-        // "proceed rather than go silently dead" fallback never once ran.
-        function luminance(el) {
-            const target = el.closest('button, [role="tab"]') || el;
-            const bg = getComputedStyle(target).backgroundColor;
-            const nums = bg.match(/[\d.]+/g);
-            if (!nums || nums.length < 3) return null;
-            const [r, g, b] = nums.map(Number);
-            const a = nums.length >= 4 ? Number(nums[3]) : 1;
-            return (0.2126 * r + 0.7152 * g + 0.0722 * b) * a;
-        }
-
-        const goodRoadsLum = luminance(goodRoadsEl);
-        const allTablesLum = luminance(allTablesEl);
-        if (goodRoadsLum === null || allTablesLum === null) return null;
-
-        // Indistinguishable backgrounds means we genuinely cannot tell.
-        // Say so (null) and let the caller proceed, rather than asserting
-        // "Good Roads is not selected" and going silent.
-        if (Math.abs(goodRoadsLum - allTablesLum) < 1) return null;
-        return goodRoadsLum > allTablesLum; // active tab has the lighter pill background
+        // No explicit marker: say so, and let the caller proceed.
+        //
+        // There used to be a luminance heuristic here - "the selected tab
+        // has the lighter pill". It was wrong in both directions and tested
+        // as such: a barely-visible rgba(255,255,255,0.12) tint on the
+        // UNSELECTED tab beat a solid dark selected one, and a design where
+        // the selected pill is DARKER inverted the answer outright. Worse,
+        // it could never return null once both labels were found, so two
+        // transparent tabs (selection shown by an underline - very common)
+        // resolved to a confident FALSE, which silences the whole script.
+        //
+        // Guessing from pixels is what made this thing unreliable. Unknown
+        // is the honest answer, it costs a few unscoped alerts instead of
+        // total silence, and the panel shows "filter unknown" so it is
+        // visible rather than mysterious. The debug snapshot dumps the real
+        // classes/aria of the filter row, so a precise rule can be written
+        // from the actual markup instead of inferred from colour.
+        return null;
     }
 
     // aria-selected / aria-current / a class containing "active"/"selected"
@@ -591,6 +580,9 @@
     // table-name headings, not provider-specific markup.
     // ---------------------------------------------------------------
     const seenGoodRoadsTables = new Set();
+    // Tracked separately so a table glimpsed under ALL TABLES doesn't count
+    // as "already seen" when it later appears under GOOD ROADS.
+    const seenUnderAllTables = new Set();
 
     // Selector list matters more than it looks. This used to be
     // 'div, span, h1..h4', which on Evolution matched exactly ONE table
@@ -655,6 +647,11 @@
     const FRAME_STALE_MS = 5000;
 
     function receiveState(state) {
+        // firstSeen must survive across reports: it is what decides when a
+        // frame is warmed up, and re-stamping it every report would keep
+        // the frame permanently un-warmed.
+        const prev = frameStates.get(state.frameId);
+        state.firstSeen = prev ? prev.firstSeen : Date.now();
         state.lastSeen = Date.now();
         frameStates.set(state.frameId, state);
 
@@ -673,20 +670,32 @@
         if (IS_TOP && currentMode === 'lobby') aggregateAndAlert();
     }
 
-    // A frame that can see the tab row answers true/false; frames that
-    // can't see it answer null and simply don't get a vote.
-    function isPatternViewActive() {
+    // Reports WHERE the answer came from, not just the answer. Evolution's
+    // grid frame can see the Hot Roads chip row while the multiplay shell
+    // sees the real ALL TABLES / GOOD ROADS tabs - two frames voting about
+    // two different views. Without a source the winner was whichever
+    // arrived first, so the same screen produced opposite gates run to run.
+    // Tabs outrank chips, always.
+    function readGate() {
         const tab = isGoodRoadsTabActive();
-        if (tab !== null) return tab;
-        return isPatternFilterActive();
+        if (tab !== null) return { value: tab, source: 'tabs' };
+        const chip = isPatternFilterActive();
+        if (chip !== null) return { value: chip, source: 'chips' };
+        return { value: null, source: null };
+    }
+
+    function isPatternViewActive() {
+        return readGate().value;
     }
 
     function postState() {
+        const gate = readGate();
         const state = {
             frameId: FRAME_ID,
             names: [...findVisibleTableNames()],
             betKeys: [...findActiveBetTables()],
-            goodRoadsActive: isPatternViewActive()
+            goodRoadsActive: gate.value,
+            gateSource: gate.source
         };
         if (IS_TOP) { receiveState(state); return; }
         try {
@@ -701,52 +710,74 @@
     // two then met ~30 names against an empty seen-set with quiet already
     // false, and fired ~30 alerts on page load. A frame's names only become
     // alertable once we've seen a report from that frame.
-    const seededFrames = new Set();
+    // Warm-up is measured in TIME, not in report count. A frame's very
+    // first report often lands before its grid has rendered (measured: a
+    // single frame reporting names one poll after detection fired 10 alerts
+    // on load), so "has reported once" is not the same as "we know what was
+    // already on screen".
+    const FRAME_WARMUP_MS = 3000;
+
+    // How many consecutive fresh passes a name must be missing before we
+    // forget it. Virtualised grids recycle rows on scroll, so a name can
+    // vanish and return within a second: measured at 5 spurious alerts from
+    // scrolling down and back up.
+    const NAME_MISS_TO_FORGET = 3;
+    const nameMissCounts = new Map();
 
     function aggregateAndAlert() {
         const now = Date.now();
-        // A frame going quiet does NOT mean its tables left the screen -
-        // most often it means Chrome throttled a hidden tab's timers to
-        // about once a minute, which is exactly when the user is in another
-        // app and needs this most. Purging its names made the next report
-        // re-alert every table: measured at 50 spurious alerts over five
-        // minutes backgrounded. Stale frames stop contributing to the gate
-        // and to bet keys, but their names are retained until a FRESH
-        // report from that same frame shows them gone.
-        const staleNames = new Set();
-        for (const [id, s] of frameStates) {
-            if (now - s.lastSeen <= FRAME_STALE_MS) continue;
-            (s.names || []).forEach(n => staleNames.add(n));
-            frameStates.delete(id);
-            seededFrames.delete(id);
-        }
         const states = [...frameStates.values()];
-        if (states.length === 0) return;
-
-        // Whichever frame can actually see the tab row decides the gate.
-        let gate = null;
-        for (const s of states) {
-            if (s.goodRoadsActive === true || s.goodRoadsActive === false) {
-                gate = s.goodRoadsActive;
-                break;
-            }
+        if (states.length === 0) {
+            updateLiveStatus('no game frame reporting', 'sn-live-bad');
+            return;
         }
 
-        // Names are attributed to the frame that reported them, so a name
-        // can only be treated as alertable once THAT frame has been seeded.
+        // Frames are NEVER evicted, only marked stale. Eviction was a
+        // catastrophic own-goal: a backgrounded tab has its timers throttled
+        // to roughly once a minute, so every frame looked stale, got dropped
+        // along with its warm-up state, and every subsequent report was
+        // treated as a cold start and suppressed. Measured on v6.4: zero
+        // alerts for a new table while backgrounded, and zero bet alerts
+        // over four minutes of a persistently open table - i.e. the tool
+        // did nothing in exactly the situation it exists for.
+        states.forEach(s => { s.stale = (now - s.lastSeen) > FRAME_STALE_MS; });
+        const fresh = states.filter(s => !s.stale);
+
+        // Tabs outrank chips, and fresh outranks stale. Deterministic
+        // regardless of which frame's message happens to arrive first.
+        function voteFrom(list, source) {
+            // Sorted, so that if two frames somehow claim the same source
+            // the winner is stable instead of "whichever message arrived
+            // first" - which produced opposite gates on identical screens.
+            const voters = list
+                .filter(s => s.gateSource === source && typeof s.goodRoadsActive === 'boolean')
+                .sort((a, b) => (a.frameId < b.frameId ? -1 : 1));
+            return voters.length ? voters[0].goodRoadsActive : null;
+        }
+        let gate = voteFrom(fresh, 'tabs');
+        if (gate === null) gate = voteFrom(fresh, 'chips');
+        // A stale vote still beats no vote. Falling back to null when the
+        // only tab-reading frame went quiet un-quieted the script and fired
+        // alerts while ALL TABLES was selected.
+        if (gate === null) gate = voteFrom(states, 'tabs');
+        if (gate === null) gate = voteFrom(states, 'chips');
+
+        // Names come from ALL frames including stale ones - a quiet frame
+        // does not mean its tables left the screen. Bet keys come only from
+        // FRESH frames, because a stale "this table is taking bets" claim is
+        // worse than none.
         const namesNow = new Set();
         const betKeysNow = new Set();
-        const nameIsSeeded = new Map();
+        const nameIsWarm = new Map();
         states.forEach(s => {
-            const seeded = seededFrames.has(s.frameId);
+            const warm = (now - s.firstSeen) >= FRAME_WARMUP_MS;
             (s.names || []).forEach(n => {
                 namesNow.add(n);
-                if (seeded) nameIsSeeded.set(n, true);
-                else if (!nameIsSeeded.has(n)) nameIsSeeded.set(n, false);
+                if (warm) nameIsWarm.set(n, true);
+                else if (!nameIsWarm.has(n)) nameIsWarm.set(n, false);
             });
-            (s.betKeys || []).forEach(k => betKeysNow.add(k));
         });
-        staleNames.forEach(n => namesNow.add(n));
+        fresh.forEach(s => (s.betKeys || []).forEach(k => betKeysNow.add(k)));
 
         // Bet debounce counts DISTINCT REPORTS from the owning frame, not
         // aggregation passes. Counting passes gave zero flicker protection:
@@ -758,45 +789,83 @@
         const nextHits = new Map();
         betKeysNow.forEach(key => {
             const prev = betOpenConsecutiveHits.get(key);
-            const reportStamp = betKeyStamp(states, key);
+            const reportStamp = betKeyStamp(fresh, key);
             if (prev && prev.stamp === reportStamp) {
                 nextHits.set(key, prev); // same report seen again - not new evidence
             } else {
-                nextHits.set(key, { hits: (prev ? prev.hits : 0) + 1, stamp: reportStamp });
+                nextHits.set(key, {
+                    hits: (prev ? prev.hits : 0) + 1,
+                    stamp: reportStamp,
+                    firstAt: prev ? prev.firstAt : now
+                });
             }
         });
         betOpenConsecutiveHits = nextHits;
+        // Two distinct reports AND at least a second of persistence. Two
+        // reports alone can still be 150ms apart (the MutationObserver
+        // throttle), which is a render flicker, not a bet window - real
+        // ones stay open for many seconds.
         const confirmedOpenKeys = new Set(
-            [...nextHits.entries()].filter(([, v]) => v.hits >= BET_HITS_TO_CONFIRM).map(([k]) => k)
+            [...nextHits.entries()]
+                .filter(([, v]) => v.hits >= BET_HITS_TO_CONFIRM && (now - v.firstAt) >= BET_MIN_PERSIST_MS)
+                .map(([k]) => k)
         );
 
-        // "ALL TABLES" is explicitly selected - keep tracking state so
-        // flipping back to GOOD ROADS doesn't spuriously alert, but stay
-        // quiet. gate === null means we couldn't tell, in which case we
-        // proceed rather than going silently dead.
+        // gate === null means we couldn't tell, in which case we proceed
+        // rather than going silently dead.
         const gateQuiet = (gate === false);
 
+        // The seen-set is scoped to the GOOD ROADS view. Keyed by name
+        // alone, a table glimpsed while browsing ALL TABLES counted as
+        // "already seen", so when it later surfaced under GOOD ROADS it was
+        // silently skipped - a missed-money false negative.
+        const newNames = [];
         namesNow.forEach(name => {
+            nameMissCounts.delete(name);
+            if (gateQuiet) { seenUnderAllTables.add(name); return; }
             if (seenGoodRoadsTables.has(name)) return;
             seenGoodRoadsTables.add(name);
-            // Suppress if this name's frame hasn't been seeded yet (page
-            // load), or if ALL TABLES is what's on screen.
-            if (gateQuiet || nameIsSeeded.get(name) !== true) return;
+            if (nameIsWarm.get(name) !== true) return; // still warming up - this was already on screen
+            newNames.push(name);
+        });
+
+        if (newNames.length === 1) {
             dispatchEvent_({
                 type: 'new-tables',
                 count: 1,
-                body: `${name} now matches your Good Roads pattern - go check.`
+                body: `${newNames[0]} now matches your Good Roads pattern - go check.`
             });
-        });
+        } else if (newNames.length > 1) {
+            // Collapse a burst into one alert. Several tables appearing in
+            // the same pass is a re-render, a tab flip or a scroll - firing
+            // N overlapping sounds and N notifications for it is the
+            // behaviour that made this thing unbearable.
+            dispatchEvent_({
+                type: 'new-tables',
+                count: newNames.length,
+                body: `${newNames.length} tables now match your Good Roads pattern - go check.`
+            });
+        }
+
+        // Forget a name only after it has been missing from several
+        // consecutive passes, so a virtualised grid recycling rows during a
+        // scroll doesn't make every row "new" again on the way back.
         for (const name of seenGoodRoadsTables) {
-            if (!namesNow.has(name)) seenGoodRoadsTables.delete(name);
+            if (namesNow.has(name)) continue;
+            const misses = (nameMissCounts.get(name) || 0) + 1;
+            nameMissCounts.set(name, misses);
+            if (misses >= NAME_MISS_TO_FORGET) {
+                seenGoodRoadsTables.delete(name);
+                seenUnderAllTables.delete(name);
+                nameMissCounts.delete(name);
+            }
         }
 
         confirmedOpenKeys.forEach(key => {
             if (betOpenTables.has(key)) return;
-            const seeded = betKeyIsSeeded(states, key);
+            const warm = betKeyIsWarm(fresh, key, now);
             betOpenTables.set(key, { escalated: false });
-            if (gateQuiet || !seeded) return;
+            if (gateQuiet || !warm) return;
             console.log('Stake Notifier: bet window opened for', key);
             dispatchEvent_({ type: 'bet-open', key });
         });
@@ -807,8 +876,28 @@
         if (betOpenTables.size === 0 && hadOpenTables) stopFlashing();
         hadOpenTables = betOpenTables.size > 0;
 
-        // Mark every frame that has now reported at least once.
-        states.forEach(s => seededFrames.add(s.frameId));
+        const gateLabel = gate === true ? 'GOOD ROADS'
+            : gate === false ? 'ALL TABLES - quiet'
+            : 'filter unknown';
+        const bits = [`${states.length} frame${states.length === 1 ? '' : 's'}`, gateLabel, `${namesNow.size} tables`];
+        if (betOpenTables.size) bits.push(`${betOpenTables.size} betting`);
+        if (lastAlertAt) bits.push(`last alert ${new Date(lastAlertAt).toLocaleTimeString()}`);
+        updateLiveStatus(bits.join(' · '), gate === false ? '' : 'sn-live-good');
+    }
+
+    // A one-line, always-visible readout of what the detector can actually
+    // see. Every failure in this project so far has been invisible from the
+    // outside - the panel looked perfectly healthy while nothing was
+    // reporting, or while the gate was stuck quiet. This turns "is it
+    // working?" from a console investigation into something you can glance
+    // at, and it means a bug report can be a screenshot instead of a
+    // debugging session.
+    let lastAlertAt = null;
+    function updateLiveStatus(text, cls) {
+        const el = document.getElementById('sn-live');
+        if (!el) return;
+        el.textContent = text;
+        el.className = cls || '';
     }
 
     // Identifies WHICH report a bet key came from, so the same report being
@@ -820,9 +909,9 @@
         return 'none';
     }
 
-    function betKeyIsSeeded(states, key) {
+    function betKeyIsWarm(states, key, now) {
         for (const s of states) {
-            if ((s.betKeys || []).includes(key)) return seededFrames.has(s.frameId);
+            if ((s.betKeys || []).includes(key)) return (now - s.firstSeen) >= FRAME_WARMUP_MS;
         }
         return false;
     }
@@ -1056,6 +1145,12 @@
             .sn-btn:hover { background: #2b2e3a; }
             .sn-btn-full { grid-column: 1 / -1; }
             #sn-status { margin-top: 8px; font-size: 10px; color: #6b6e7a; }
+            /* One line, always visible when the panel is open. This is the
+               difference between "is it working?" being a console
+               investigation and being something you can just look at. */
+            #sn-live { margin-top: 6px; font-size: 10px; color: #8b8f9c; line-height: 1.35; }
+            #sn-live.sn-live-bad { color: #e0864f; }
+            #sn-live.sn-live-good { color: #59c17a; }
         `;
         document.head.appendChild(styleTag);
 
@@ -1076,6 +1171,8 @@
                     <button id="sn-toggle-telegram" class="sn-icon-btn" title="Phone push (Telegram)">📱</button>
                     <button id="sn-toggle-advanced" class="sn-icon-btn" title="More settings">⚙</button>
                 </div>
+
+                <div id="sn-live" title="What the detector can see right now">starting...</div>
 
                 <div id="sn-advanced">
                     <div class="sn-section">
