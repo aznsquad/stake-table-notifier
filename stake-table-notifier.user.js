@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stake Table Notifier (Evolution + Pragmatic)
 // @namespace    http://tampermonkey.net/
-// @version      6.3
+// @version      6.4
 // @description  Escalating alerts (sound -> flashing tab -> Windows popup -> phone push) so you never miss a bet window, even when distracted on another tab or your phone
 // @author       You
 // @match        *://*/*
@@ -64,7 +64,7 @@
     // guess again. Tampermonkey caches @require content aggressively, and
     // several rounds of debugging were wasted testing stale code that
     // looked identical from the outside. Keep this in sync with @version.
-    const SCRIPT_VERSION = '6.3';
+    const SCRIPT_VERSION = '6.4';
 
     const CHECK_INTERVAL_MS = 500;
     const ESCALATION_DELAY_MS = 8000;      // how long a bet window must stay open + you stay away before we buzz your phone
@@ -228,6 +228,7 @@
 
     function listenForFrameEvents() {
         window.addEventListener('message', (e) => {
+            if (e.source === window) return; // our own postState, already handled directly
             const d = e.data;
             if (!d || d.__marker !== BRIDGE_MARKER) return;
             if (d.debug) { receiveDebugSnapshot(d.debug); return; }
@@ -453,11 +454,14 @@
         const neutralEl = findShortestTextMatch(/^speed$/i, 12);
         if (!patternEl || !neutralEl) return null;
 
-        function colorOf(el) {
-            const target = el.closest('button') || el;
-            return getComputedStyle(target).color;
-        }
-        return colorOf(patternEl) !== colorOf(neutralEl);
+        // Only trust an explicit selection marker. The old test was "is Hot
+        // Roads a different colour from Speed", which answers TRUE whenever
+        // the user selects SPEED - Speed lights up, Hot Roads dims, the
+        // colours differ, and the script concludes Hot Roads is active.
+        // Any chip being selected made every other chip look selected.
+        // Unknown (null) is an honest answer here; the caller proceeds on
+        // null, which costs a few extra alerts rather than total silence.
+        return explicitSelection(patternEl, neutralEl);
     }
 
     // ---------------------------------------------------------------
@@ -486,19 +490,62 @@
         const goodRoadsEl = findShortestTextMatch(/good\s*roads/i, 24);
         if (!allTablesEl || !goodRoadsEl) return null;
 
+        // Prefer whatever the markup states outright. Guessing from pixels
+        // is a last resort, not a first choice.
+        const explicit = explicitSelection(goodRoadsEl, allTablesEl);
+        if (explicit !== null) return explicit;
+
+        // Luminance WEIGHTED BY ALPHA. The old version pulled r,g,b out of
+        // the computed backgroundColor and threw the alpha away, so
+        // rgba(255,255,255,0.12) - a barely-visible tint - scored a full
+        // 255 and beat a solid dark pill. It also treated the extremely
+        // common "both tabs transparent, selection shown by an underline or
+        // text colour" case as a definite FALSE rather than "can't tell":
+        // rgba(0,0,0,0) parses to four numbers, passes the length check,
+        // and yields 0 for both, so 0 > 0 === false. That single false
+        // silences the entire script - gate false means quiet, on both
+        // providers, with no diagnostic. It was structurally impossible for
+        // this function to return null once both labels were found, so the
+        // "proceed rather than go silently dead" fallback never once ran.
         function luminance(el) {
-            const target = el.closest('button') || el;
+            const target = el.closest('button, [role="tab"]') || el;
             const bg = getComputedStyle(target).backgroundColor;
             const nums = bg.match(/[\d.]+/g);
             if (!nums || nums.length < 3) return null;
             const [r, g, b] = nums.map(Number);
-            return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            const a = nums.length >= 4 ? Number(nums[3]) : 1;
+            return (0.2126 * r + 0.7152 * g + 0.0722 * b) * a;
         }
 
         const goodRoadsLum = luminance(goodRoadsEl);
         const allTablesLum = luminance(allTablesEl);
         if (goodRoadsLum === null || allTablesLum === null) return null;
+
+        // Indistinguishable backgrounds means we genuinely cannot tell.
+        // Say so (null) and let the caller proceed, rather than asserting
+        // "Good Roads is not selected" and going silent.
+        if (Math.abs(goodRoadsLum - allTablesLum) < 1) return null;
         return goodRoadsLum > allTablesLum; // active tab has the lighter pill background
+    }
+
+    // aria-selected / aria-current / a class containing "active"/"selected"
+    // are all far more reliable than colour, when present.
+    function explicitSelection(targetEl, otherEl) {
+        function state(el) {
+            const box = el.closest('button, [role="tab"], li, a') || el;
+            const aria = box.getAttribute('aria-selected') || box.getAttribute('aria-current');
+            if (aria === 'true') return true;
+            if (aria === 'false') return false;
+            const cls = (box.className || '').toString();
+            if (/\b(is-)?(active|selected)\b/i.test(cls)) return true;
+            return null;
+        }
+        const t = state(targetEl);
+        const o = state(otherEl);
+        if (t === true) return true;
+        if (o === true) return false;
+        if (t === false) return false;
+        return null;
     }
 
     // Finds every table currently showing its PLAYER/TIE/BANKER betting
@@ -555,7 +602,24 @@
 
     // \p{L} rather than A-Za-z: "Salon Privé Baccarat A" was silently
     // excluded by the old ASCII-only class.
-    const TABLE_NAME_RE = /^[\p{L}][\p{L}0-9\s'&\-]{2,40}(Baccarat|Dragon Tiger)[\p{L}0-9\s'&\-]{0,10}$/iu;
+    // The prefix is OPTIONAL. It used to be mandatory and at least 3
+    // characters long, which meant Evolution's plain "Baccarat A" through
+    // "Baccarat E", "Baccarat Control Squeeze" and bare "Dragon Tiger"
+    // could never match - those tables were incapable of raising an alert.
+    // '&' is deliberately excluded from both sides so the navigation
+    // category "Baccarat & Sic Bo" isn't mistaken for a table.
+    // Trailing allowance is 30, not 10: "Baccarat Control Squeeze" has 16
+    // characters after the keyword and was being rejected.
+    const TABLE_NAME_RE = /^(?:[\p{L}][\p{L}0-9\s'\-]{1,40}\s)?(Baccarat|Dragon Tiger)[\p{L}0-9\s'\-]{0,20}$/iu;
+
+    // Table names are short labels, not prose. Without this, marketing copy
+    // like "Play Baccarat now and win big prizes today" matches the shape
+    // above and becomes a phantom table.
+    const MAX_NAME_WORDS = 5;
+
+    // Bare "Baccarat" is Stake's category heading, not a table. Bare
+    // "Dragon Tiger" IS a real Evolution table, so it must not be excluded.
+    const BARE_CATEGORY_RE = /^baccarat$/i;
 
     function findVisibleTableNames() {
         const leafEls = Array.from(document.querySelectorAll(NAME_LEAF_SELECTOR))
@@ -563,7 +627,10 @@
         const names = new Set();
         leafEls.forEach(el => {
             const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
-            if (TABLE_NAME_RE.test(t)) names.add(t);
+            if (!TABLE_NAME_RE.test(t)) return;
+            if (BARE_CATEGORY_RE.test(t)) return;
+            if (t.split(' ').length > MAX_NAME_WORDS) return;
+            names.add(t);
         });
         return names;
     }
@@ -627,12 +694,31 @@
         } catch (e) { /* nothing to do */ }
     }
 
-    let aggregateSeeded = false;
+    // Per-frame seeding, not one global flag. Evolution's frames arrive in
+    // separate postMessage deliveries and each one triggers an aggregation
+    // pass, so a single global flag was set to "seeded" by the FIRST pass -
+    // which only had the tab-state frame in it, carrying zero names. Pass
+    // two then met ~30 names against an empty seen-set with quiet already
+    // false, and fired ~30 alerts on page load. A frame's names only become
+    // alertable once we've seen a report from that frame.
+    const seededFrames = new Set();
 
     function aggregateAndAlert() {
         const now = Date.now();
+        // A frame going quiet does NOT mean its tables left the screen -
+        // most often it means Chrome throttled a hidden tab's timers to
+        // about once a minute, which is exactly when the user is in another
+        // app and needs this most. Purging its names made the next report
+        // re-alert every table: measured at 50 spurious alerts over five
+        // minutes backgrounded. Stale frames stop contributing to the gate
+        // and to bet keys, but their names are retained until a FRESH
+        // report from that same frame shows them gone.
+        const staleNames = new Set();
         for (const [id, s] of frameStates) {
-            if (now - s.lastSeen > FRAME_STALE_MS) frameStates.delete(id);
+            if (now - s.lastSeen <= FRAME_STALE_MS) continue;
+            (s.names || []).forEach(n => staleNames.add(n));
+            frameStates.delete(id);
+            seededFrames.delete(id);
         }
         const states = [...frameStates.values()];
         if (states.length === 0) return;
@@ -646,32 +732,56 @@
             }
         }
 
+        // Names are attributed to the frame that reported them, so a name
+        // can only be treated as alertable once THAT frame has been seeded.
         const namesNow = new Set();
         const betKeysNow = new Set();
+        const nameIsSeeded = new Map();
         states.forEach(s => {
-            (s.names || []).forEach(n => namesNow.add(n));
+            const seeded = seededFrames.has(s.frameId);
+            (s.names || []).forEach(n => {
+                namesNow.add(n);
+                if (seeded) nameIsSeeded.set(n, true);
+                else if (!nameIsSeeded.has(n)) nameIsSeeded.set(n, false);
+            });
             (s.betKeys || []).forEach(k => betKeysNow.add(k));
         });
+        staleNames.forEach(n => namesNow.add(n));
 
-        // Debounce bet detection: 2 consecutive agreeing polls, to kill
-        // one-frame flicker.
+        // Bet debounce counts DISTINCT REPORTS from the owning frame, not
+        // aggregation passes. Counting passes gave zero flicker protection:
+        // a pass is triggered by every inbound message from ANY frame and
+        // by the top frame's own 500ms timer, so one genuine sighting got
+        // counted twice within milliseconds by an unrelated trigger and
+        // fired immediately. That is the "sound when cards are dealt / when
+        // placing a bet" complaint.
         const nextHits = new Map();
-        betKeysNow.forEach(key => nextHits.set(key, (betOpenConsecutiveHits.get(key) || 0) + 1));
+        betKeysNow.forEach(key => {
+            const prev = betOpenConsecutiveHits.get(key);
+            const reportStamp = betKeyStamp(states, key);
+            if (prev && prev.stamp === reportStamp) {
+                nextHits.set(key, prev); // same report seen again - not new evidence
+            } else {
+                nextHits.set(key, { hits: (prev ? prev.hits : 0) + 1, stamp: reportStamp });
+            }
+        });
         betOpenConsecutiveHits = nextHits;
         const confirmedOpenKeys = new Set(
-            [...nextHits.entries()].filter(([, h]) => h >= BET_HITS_TO_CONFIRM).map(([k]) => k)
+            [...nextHits.entries()].filter(([, v]) => v.hits >= BET_HITS_TO_CONFIRM).map(([k]) => k)
         );
 
         // "ALL TABLES" is explicitly selected - keep tracking state so
         // flipping back to GOOD ROADS doesn't spuriously alert, but stay
         // quiet. gate === null means we couldn't tell, in which case we
         // proceed rather than going silently dead.
-        const quiet = (gate === false) || !aggregateSeeded;
+        const gateQuiet = (gate === false);
 
         namesNow.forEach(name => {
             if (seenGoodRoadsTables.has(name)) return;
             seenGoodRoadsTables.add(name);
-            if (quiet) return;
+            // Suppress if this name's frame hasn't been seeded yet (page
+            // load), or if ALL TABLES is what's on screen.
+            if (gateQuiet || nameIsSeeded.get(name) !== true) return;
             dispatchEvent_({
                 type: 'new-tables',
                 count: 1,
@@ -684,8 +794,9 @@
 
         confirmedOpenKeys.forEach(key => {
             if (betOpenTables.has(key)) return;
+            const seeded = betKeyIsSeeded(states, key);
             betOpenTables.set(key, { escalated: false });
-            if (quiet) return;
+            if (gateQuiet || !seeded) return;
             console.log('Stake Notifier: bet window opened for', key);
             dispatchEvent_({ type: 'bet-open', key });
         });
@@ -696,7 +807,24 @@
         if (betOpenTables.size === 0 && hadOpenTables) stopFlashing();
         hadOpenTables = betOpenTables.size > 0;
 
-        aggregateSeeded = true;
+        // Mark every frame that has now reported at least once.
+        states.forEach(s => seededFrames.add(s.frameId));
+    }
+
+    // Identifies WHICH report a bet key came from, so the same report being
+    // re-read on a later pass doesn't count as fresh confirming evidence.
+    function betKeyStamp(states, key) {
+        for (const s of states) {
+            if ((s.betKeys || []).includes(key)) return `${s.frameId}@${s.lastSeen}`;
+        }
+        return 'none';
+    }
+
+    function betKeyIsSeeded(states, key) {
+        for (const s of states) {
+            if ((s.betKeys || []).includes(key)) return seededFrames.has(s.frameId);
+        }
+        return false;
     }
 
 
@@ -1220,9 +1348,21 @@
     }
 
     let currentMode = null;
+    let frameDetector = null; // cleared once a mode is chosen, so it can't re-fire later
 
     function init(mode) {
+        // Never re-init. Without this, a second activation installs a
+        // second 500ms interval and a second MutationObserver on the same
+        // document - and worse, can flip a top frame that is already in
+        // 'lobby' mode over to 'game-frame', after which it stops
+        // aggregating and goes permanently silent while still showing a
+        // healthy-looking panel.
+        if (currentMode !== null) return;
+        // The top frame is the only thing that can make a sound. It is
+        // never a game frame, whatever its DOM happens to look like.
+        if (IS_TOP && mode === 'game-frame') return;
         currentMode = mode;
+        if (frameDetector) { clearInterval(frameDetector); frameDetector = null; }
         console.log(`Stake Notifier: ACTIVE (v${SCRIPT_VERSION}, mode=${mode}, provider=${detectProvider()}, frame=${location.hostname})`);
         logIframeAccess();
 
@@ -1298,9 +1438,10 @@
         // opens a table) was never picked up. Keep checking indefinitely -
         // it's a cheap text test, and the frame's content genuinely does
         // change over the life of a session.
-        const detector = setInterval(() => {
+        frameDetector = setInterval(() => {
             if (looksLikeLiveCasinoFrame()) {
-                clearInterval(detector);
+                clearInterval(frameDetector);
+                frameDetector = null;
                 init('game-frame');
             }
         }, 1500);
